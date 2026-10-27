@@ -35,7 +35,7 @@ pub(crate) struct SlotMarks {
 
 impl SlotMarks {
     pub(crate) fn of(e: &Expr) -> Self {
-        Self { decisions: e.decisions & SLOT_MARKS, keyword_arg: e.keyword_arg.clone() }
+        Self { decisions: e.decisions & SLOT_MARKS, keyword_arg: e.cold().keyword_arg.clone() }
     }
 
     /// Put the marks back on whatever now fills the slot. An unmarked
@@ -45,7 +45,7 @@ impl SlotMarks {
             return;
         }
         e.decisions = (e.decisions & !SLOT_MARKS) | self.decisions;
-        e.keyword_arg = self.keyword_arg;
+        crate::expr::ExprCold::update(&mut e.cold, |c| c.keyword_arg = self.keyword_arg);
     }
 }
 

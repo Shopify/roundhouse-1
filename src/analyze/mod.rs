@@ -164,7 +164,7 @@ pub struct Analyzer {
     /// `ActiveSupport.on_load(:hook)` block (`ingest::initializer_programs`).
     load_hook_bases: std::collections::BTreeMap<String, ClassId>,
     /// The app's translations, for `t` / `I18n.t` (see `crate::i18n`).
-    i18n: crate::i18n::Catalog,
+    i18n: std::sync::Arc<crate::i18n::Catalog>,
     /// The tree loads the real i18n gem (`App::carries_i18n_gem`).
     i18n_gem: bool,
     /// `app/helpers` modules, whose bodies run in a view and take
@@ -1624,7 +1624,7 @@ impl Analyzer {
                 .map(|(hook, base, _)| (hook.to_string(), ClassId(Symbol::from(*base))))
                 .chain(app.load_hook_bases.iter().map(|(hook, base)| (hook.clone(), ClassId(Symbol::from(base.as_str())))))
                 .collect(),
-            i18n: app.i18n.clone(),
+            i18n: std::sync::Arc::clone(&app.i18n),
             i18n_gem: app.carries_i18n_gem(),
             helper_modules: app.helper_method_index.values().cloned().collect(),
             open_classes: open_classes::OpenClasses::of(app),
@@ -1791,7 +1791,7 @@ impl Analyzer {
                     app.gem_boundary.refused_includes.push(crate::gem_boundary::RefusedInclude {
                         class: class.name.clone(), include: included.clone(), detail: detail.clone(),
                     });
-                    if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
+                    if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic(),
                         Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                         if construct.as_str() == "gem_requires_rails" && old == &detail)) { continue; }
                     class.unknown_calls.push(include_refusal("gem_requires_rails", detail, crate::span::Span::synthetic()));
@@ -1829,7 +1829,7 @@ impl Analyzer {
                     || (self.source_indexed && self.includes_source_namespace(included.0.as_str(), class.name.0.as_str(), rooted));
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, written.0);
-                if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
+                if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic(),
                     Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                     if construct.as_str() == "include" && old == &detail)) { continue; }
                 // The call's own span, carried alongside `includes`
@@ -1845,9 +1845,9 @@ impl Analyzer {
                 let ModelBodyItem::Unknown { expr, .. } = item else { continue };
                 let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
                 if method.as_str() != "include" { continue; }
-                if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+                if matches!(&expr.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
                     if matches!(construct.as_str(), "include" | "gem_requires_rails")) {
-                    expr.diagnostic = None;
+                    crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
                 }
                 let mut refused = Vec::new();
                 let missing: Vec<_> = args.iter().filter_map(|arg| {
@@ -1883,14 +1883,14 @@ impl Analyzer {
                     (!known).then_some(name)
                 }).collect();
                 if !missing.is_empty() {
-                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None, construct: Symbol::from("include"),
                         detail: format!("{} includes unresolved {}", model.name.0, missing.join(", ")),
-                    });
+                    }));
                 } else if let Some(first) = refused.first() {
-                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None, construct: Symbol::from("gem_requires_rails"), detail: first.detail.clone(),
-                    });
+                    }));
                 }
                 app.gem_boundary.refused_includes.extend(refused);
             }
@@ -9126,9 +9126,9 @@ fn class_ids_for_call_receiver(ty: &Ty) -> Vec<ClassId> {
 fn include_refusal(construct: &str, detail: String, span: crate::span::Span) -> crate::expr::Expr {
     let mut refusal = crate::expr::Expr::new(span,
         crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
-    refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+    refusal.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
         target: None, construct: Symbol::from(construct), detail,
-    });
+    }));
     refusal
 }
 
@@ -9142,7 +9142,7 @@ pub fn is_include_refusal(call: &crate::expr::Expr) -> bool {
     // The record carries the include's own span (`class.include_spans`)
     // when ingest has one, so it is told by its node and diagnostic.
     matches!(&*call.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })
-        && matches!(&call.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+        && matches!(&call.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
             if matches!(construct.as_str(), "include" | "gem_requires_rails"))
 }
 
@@ -11523,4 +11523,55 @@ fn expr_calls_super(body: &Expr) -> bool {
     let mut found = matches!(&*body.node, ExprNode::Super { .. });
     body.node.for_each_child(&mut |c| found = found || expr_calls_super(c));
     found
+}
+
+#[cfg(feature = "memory-census")]
+impl Analyzer {
+    /// Drop the analyzer one field at a time and report what each held
+    /// (`ROUNDHOUSE_MEMORY_CENSUS=1`). Destructured without `..`, so a new
+    /// field has to be listed here; the `Copy` flags and counters own no heap.
+    pub fn census_drop(self) {
+        let Analyzer { classes, inferred_params, declared_signatures, adapter, concern_folded, host_folded, catalog_lent, extension_modules, inquirers, load_hook_bases, i18n, i18n_gem: _, helper_modules, open_classes, refined_action_bindings, const_resolver, source_indexed: _, gem_sources, extensions, typed_constants, data_factories, recursive_methods, fixpoint_rounds: _, constant_rounds: _, incremental, param_tables, site_cache, const_memo, return_cache, setup_scan, init_memo, class_factories, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_checks } = self;
+        let mut freed: Vec<(&str, i64)> = vec![
+            ("classes", crate::memory_census::freed_by(|| drop(classes))),
+            ("inferred_params", crate::memory_census::freed_by(|| drop(inferred_params))),
+            ("declared_signatures", crate::memory_census::freed_by(|| drop(declared_signatures))),
+            ("adapter", crate::memory_census::freed_by(|| drop(adapter))),
+            ("concern_folded", crate::memory_census::freed_by(|| drop(concern_folded))),
+            ("host_folded", crate::memory_census::freed_by(|| drop(host_folded))),
+            ("catalog_lent", crate::memory_census::freed_by(|| drop(catalog_lent))),
+            ("extension_modules", crate::memory_census::freed_by(|| drop(extension_modules))),
+            ("inquirers", crate::memory_census::freed_by(|| drop(inquirers))),
+            ("load_hook_bases", crate::memory_census::freed_by(|| drop(load_hook_bases))),
+            ("i18n", crate::memory_census::freed_by(|| drop(i18n))),
+            ("helper_modules", crate::memory_census::freed_by(|| drop(helper_modules))),
+            ("open_classes", crate::memory_census::freed_by(|| drop(open_classes))),
+            ("refined_action_bindings", crate::memory_census::freed_by(|| drop(refined_action_bindings))),
+            ("const_resolver", crate::memory_census::freed_by(|| drop(const_resolver))),
+            ("gem_sources", crate::memory_census::freed_by(|| drop(gem_sources))),
+            ("extensions", crate::memory_census::freed_by(|| drop(extensions))),
+            ("typed_constants", crate::memory_census::freed_by(|| drop(typed_constants))),
+            ("data_factories", crate::memory_census::freed_by(|| drop(data_factories))),
+            ("recursive_methods", crate::memory_census::freed_by(|| drop(recursive_methods))),
+            ("incremental", crate::memory_census::freed_by(|| drop(incremental))),
+            ("param_tables", crate::memory_census::freed_by(|| drop(param_tables))),
+            ("site_cache", crate::memory_census::freed_by(|| drop(site_cache))),
+            ("const_memo", crate::memory_census::freed_by(|| drop(const_memo))),
+            ("return_cache", crate::memory_census::freed_by(|| drop(return_cache))),
+            ("setup_scan", crate::memory_census::freed_by(|| drop(setup_scan))),
+            ("init_memo", crate::memory_census::freed_by(|| drop(init_memo))),
+            ("class_factories", crate::memory_census::freed_by(|| drop(class_factories))),
+            ("data_factories_without_custom_initialize", crate::memory_census::freed_by(|| drop(data_factories_without_custom_initialize))),
+            ("view_seeds", crate::memory_census::freed_by(|| drop(view_seeds))),
+            ("callers_by_target", crate::memory_census::freed_by(|| drop(callers_by_target))),
+            ("controller_action_meta_cache", crate::memory_census::freed_by(|| drop(controller_action_meta_cache))),
+            ("fixpoint_checks", crate::memory_census::freed_by(|| drop(fixpoint_checks))),
+        ];
+        let total: i64 = freed.iter().map(|(_, bytes)| bytes).sum();
+        freed.sort_by_key(|(name, bytes)| (-bytes, *name));
+        for (name, bytes) in freed.iter().filter(|(_, bytes)| *bytes >= 1_000_000) {
+            crate::memory_census::note("analyzer", format_args!("field {name}: {:.1}MB", *bytes as f64 / 1e6));
+        }
+        crate::memory_census::note("analyzer", format_args!("total {:.1}MB", total as f64 / 1e6));
+    }
 }

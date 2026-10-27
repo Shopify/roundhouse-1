@@ -9,9 +9,11 @@
 # `class_eval`, anything else under `instance_eval`; `yield: true` calls
 # it with the base instead; `run_once: true` runs a block at most once.
 #
-# CRuby-only (the PostgreSQL tree, `project::apply_on_load_hooks`). The
-# emitted boot registers the app's lifted initializer hooks
-# (`ingest::on_load_hooks`), and `DatabaseConfiguration.configure!` runs
+# CRuby-only: the PostgreSQL tree (`project::apply_postgres_bootstrap`),
+# and any other CRuby tree whose support files register a hook as they
+# load (`project::apply_file_load_hooks`). The PostgreSQL boot registers
+# the app's lifted initializer hooks (`ingest::on_load_hooks`), and
+# `DatabaseConfiguration.configure!` runs
 # `:active_record_postgresqladapter` where Active Record would load the
 # adapter class: inside establish_connection, before any connection.
 #

@@ -119,10 +119,14 @@ pub fn ingest_schema_with_generated_expression_dialect(
 /// filename order (timestamp prefixes sort chronologically).
 ///
 /// Only the migration's `change` method is replayed (`up` when no
-/// `change` exists; `down` is never touched). Schema-mutating verbs we
-/// can't fold deterministically (`change_table`, `execute`, raw-SQL
-/// shapes — see `UNSUPPORTED_VERBS`, or a verb whose table or column
-/// name is not a literal) error with a pointer to
+/// `change` exists; `down` is never touched). `change_table` blocks
+/// fold through the verbs their `t.<method>` calls stand for
+/// ([`apply_change_table`]), and `execute` folds when its SQL only
+/// changes a table's default character set or collation
+/// ([`apply_execute`]). Schema-mutating verbs we can't fold
+/// deterministically (other raw SQL, the verbs in
+/// `UNSUPPORTED_VERBS`, or a verb whose table or column name is not a
+/// literal) error with a pointer to
 /// `rails db:migrate`, which materializes the schema.rb this fallback
 /// substitutes for. Receiver-less calls that aren't recognized verbs
 /// are ignored: migrations legitimately contain arbitrary Ruby (data
@@ -200,12 +204,12 @@ pub fn ingest_migration_with_generated_expression_dialect(
 
 /// Verbs that mutate schema in ways the fold doesn't model. Erroring
 /// (rather than skipping) keeps the derived schema honest — a silently
-/// missed `change_table` would surface later as baffling type errors.
+/// missed `revert` would surface later as baffling type errors. Raw SQL
+/// (`execute`) gets the same treatment unless [`apply_execute`] can
+/// prove it changes nothing the fold models.
 const UNSUPPORTED_VERBS: &[&str] = &[
-    "change_table",
     "create_join_table",
     "drop_join_table",
-    "execute",
     "reversible",
     "revert",
     "up_only",
@@ -229,33 +233,9 @@ fn apply_migration_verb(
         });
     }
 
-    let args: Vec<Node<'_>> = call
-        .arguments()
-        .map(|a| a.arguments().iter().collect())
-        .unwrap_or_default();
-    let arg_name = |i: usize| args.get(i).and_then(table_name_value);
-    // A verb whose table or column name is not a literal cannot apply,
-    // and skipping it left the column typed: a
-    // `remove_column(:idx, :"col_#{n}")` in an `each` loop
-    // kept the dropped columns.
-    let named = match verb {
-        "drop_table" | "add_timestamps" => 1,
-        "rename_table" | "remove_column" | "change_column_null" | "change_column_default"
-        | "add_reference" | "add_belongs_to" | "remove_reference" | "remove_belongs_to" => 2,
-        "add_column" | "change_column" | "rename_column" => 3,
-        _ => 0,
-    };
-    if let Some(i) = (0..named).find(|&i| arg_name(i).is_none()) {
-        return Err(IngestError::Unsupported {
-            file: file.into(),
-            message: format!(
-                "migration `{verb}` argument {} is not a literal name; the schema fold cannot apply it",
-                i + 1
-            ),
-        });
-    }
-
+    let args = call_arguments(call);
     match verb {
+        "execute" => apply_execute(&args, file),
         "create_table" => {
             let mut gaps: Vec<IngestError> = Vec::new();
             let built = table_from_create_table(call, file, &mut gaps, dialect);
@@ -283,7 +263,239 @@ fn apply_migration_verb(
                 }
                 schema.tables.insert(name, table);
             }
+            Ok(())
         }
+        "change_table" => apply_change_table(call, &args, file, schema, dialect),
+        _ => apply_table_verb(verb, &args, file, schema, dialect),
+    }
+}
+
+/// `execute "<SQL>"`. The fold cannot run SQL, so a statement folds
+/// only when it provably changes nothing the fold models, and anything
+/// else stays a gap naming the verb, like `UNSUPPORTED_VERBS`. What
+/// folds today are MySQL table options that set a table's default
+/// character set or collation, the usual tail of a charset migration:
+///
+/// ```sql
+/// ALTER TABLE posts COLLATE=utf8mb4_bin
+/// ALTER TABLE posts DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+/// ```
+///
+/// The fold models neither, and a table default only applies to columns
+/// added later, so no column changes. `CONVERT TO CHARACTER SET` is not
+/// one of them: it rewrites the existing string columns, and MySQL may
+/// change their types to keep their length (a long `VARCHAR` can become
+/// a `TEXT` type). The SQL must be a literal string (a heredoc with no
+/// interpolation counts), and every statement in it has to be one of
+/// these.
+fn apply_execute(args: &[Node<'_>], file: &str) -> Result<(), IngestError> {
+    let refuse = |why: String| {
+        Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "migration verb `execute` {why}, which the schema fold does not model — run \
+                 `rails db:migrate` to materialize db/schema.rb"
+            ),
+        })
+    };
+    // `execute(sql, name = nil)`: the name only labels the log line.
+    let Some(sql) = args.first().and_then(literal_text) else {
+        return refuse("is not given a literal SQL string".to_string());
+    };
+    let unmodeled = || {
+        let collapsed = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let shown: String = collapsed.chars().take(80).collect();
+        let ellipsis = if collapsed.chars().count() > 80 { "…" } else { "" };
+        refuse(format!("runs `{shown}{ellipsis}`"))
+    };
+    let Some(tokens) = sql_tokens(&sql) else {
+        return unmodeled();
+    };
+    for statement in tokens.split(|token| *token == SqlToken::Punct(';')) {
+        if !statement.is_empty() && !is_table_charset_change(statement) {
+            return unmodeled();
+        }
+    }
+    Ok(())
+}
+
+/// The text of a string literal, including a heredoc whose parts are
+/// all literal text (`<<~SQL` dedents into several string parts).
+/// `None` for anything that interpolates or is not a string.
+fn literal_text(node: &Node<'_>) -> Option<String> {
+    if let Some(string) = node.as_string_node() {
+        return std::str::from_utf8(string.unescaped()).ok().map(str::to_string);
+    }
+    let mut text = String::new();
+    for part in node.as_interpolated_string_node()?.parts().iter() {
+        text.push_str(&literal_text(&part)?);
+    }
+    Some(text)
+}
+
+/// One token of the SQL [`apply_execute`] reads.
+#[derive(Debug, PartialEq)]
+enum SqlToken {
+    /// A bare word, uppercased: a keyword or an unquoted name.
+    Word(String),
+    /// A quoted name (`` `posts` ``, `"posts"`) or string (`'utf8mb4'`).
+    Quoted(String),
+    /// `=`, `,`, `.` or `;`.
+    Punct(char),
+}
+
+/// Tokenize `sql`, dropping whitespace and comments. `None` for anything
+/// outside the small grammar the fold reads, including MySQL's
+/// executable comments (`/*! … */`) and optimizer hints (`/*+ … */`),
+/// which run their contents rather than hiding them.
+fn sql_tokens(sql: &str) -> Option<Vec<SqlToken>> {
+    let characters: Vec<char> = sql.chars().collect();
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    while let Some(&character) = characters.get(position) {
+        let next = characters.get(position + 1).copied();
+        match character {
+            _ if character.is_whitespace() => position += 1,
+            '-' if next == Some('-') => {
+                while characters.get(position).is_some_and(|&c| c != '\n') {
+                    position += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                if matches!(characters.get(position + 2), Some('!' | '+')) {
+                    return None;
+                }
+                let close = (position + 2..characters.len().saturating_sub(1))
+                    .find(|&at| characters[at] == '*' && characters[at + 1] == '/')?;
+                position = close + 2;
+            }
+            '\'' | '"' | '`' => {
+                let mut text = String::new();
+                position += 1;
+                loop {
+                    match characters.get(position) {
+                        None | Some('\\') => return None,
+                        Some(&c) if c == character => {
+                            if characters.get(position + 1) == Some(&character) {
+                                text.push(character);
+                                position += 2;
+                            } else {
+                                position += 1;
+                                break;
+                            }
+                        }
+                        Some(&c) => {
+                            text.push(c);
+                            position += 1;
+                        }
+                    }
+                }
+                tokens.push(SqlToken::Quoted(text));
+            }
+            '=' | ',' | '.' | ';' => {
+                tokens.push(SqlToken::Punct(character));
+                position += 1;
+            }
+            _ if character.is_ascii_alphanumeric() || character == '_' || character == '$' => {
+                let start = position;
+                while characters
+                    .get(position)
+                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                {
+                    position += 1;
+                }
+                let word: String = characters[start..position].iter().collect();
+                tokens.push(SqlToken::Word(word.to_ascii_uppercase()));
+            }
+            _ => return None,
+        }
+    }
+    Some(tokens)
+}
+
+/// `ALTER TABLE <name> <option>[[,] <option>]…` where every option sets
+/// the table's default character set or collation:
+/// `[DEFAULT] {CHARACTER SET | CHARSET} [=] <name>` or
+/// `[DEFAULT] COLLATE [=] <name>`.
+fn is_table_charset_change(statement: &[SqlToken]) -> bool {
+    let word = |at: usize, keyword: &str| matches!(statement.get(at), Some(SqlToken::Word(w)) if w == keyword);
+    let punct = |at: usize, mark: char| statement.get(at) == Some(&SqlToken::Punct(mark));
+    let name = |at: usize| matches!(statement.get(at), Some(SqlToken::Word(_) | SqlToken::Quoted(_)));
+    // `CHARACTER SET` or `CHARSET` at `at`: the position after it.
+    let charset = |at: usize| match () {
+        _ if word(at, "CHARACTER") && word(at + 1, "SET") => Some(at + 2),
+        _ if word(at, "CHARSET") => Some(at + 1),
+        _ => None,
+    };
+    if !(word(0, "ALTER") && word(1, "TABLE") && name(2)) {
+        return false;
+    }
+    let mut at = 3;
+    if punct(at, '.') {
+        if !name(at + 1) {
+            return false;
+        }
+        at += 2;
+    }
+    let mut options = 0;
+    while at < statement.len() {
+        if options > 0 && punct(at, ',') {
+            at += 1;
+        }
+        if word(at, "DEFAULT") {
+            at += 1;
+        }
+        let Some(after) = charset(at).or_else(|| word(at, "COLLATE").then_some(at + 1)) else {
+            return false;
+        };
+        at = if punct(after, '=') { after + 1 } else { after };
+        if !name(at) {
+            return false;
+        }
+        at += 1;
+        options += 1;
+    }
+    options > 0
+}
+
+/// A call's arguments, in order.
+fn call_arguments<'pr>(call: &ruby_prism::CallNode<'pr>) -> Vec<Node<'pr>> {
+    call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default()
+}
+
+/// Apply one migration verb whose first argument names the table it
+/// changes. `change_table`'s `t.<method>` calls come here too, with
+/// the block's table prepended to their arguments.
+fn apply_table_verb(
+    verb: &str,
+    args: &[Node<'_>],
+    file: &str,
+    schema: &mut Schema,
+    dialect: GeneratedExpressionDialect,
+) -> Result<(), IngestError> {
+    let arg_name = |i: usize| args.get(i).and_then(table_name_value);
+    // A verb whose table or column name is not a literal cannot apply,
+    // and skipping it left the column typed: a
+    // `remove_column(:idx, :"col_#{n}")` in an `each` loop
+    // kept the dropped columns.
+    let named = match verb {
+        "drop_table" | "add_timestamps" | "remove_timestamps" => 1,
+        "rename_table" | "remove_column" | "change_column_null" | "change_column_default"
+        | "add_reference" | "add_belongs_to" | "remove_reference" | "remove_belongs_to" => 2,
+        "add_column" | "change_column" | "rename_column" | "rename_index" => 3,
+        _ => 0,
+    };
+    if let Some(i) = (0..named).find(|&i| arg_name(i).is_none()) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "migration `{verb}` argument {} is not a literal name; the schema fold cannot apply it",
+                i + 1
+            ),
+        });
+    }
+
+    match verb {
         "drop_table" => {
             if let Some(name) = arg_name(0) {
                 schema.tables.shift_remove(&Symbol::from(name));
@@ -298,114 +510,13 @@ fn apply_migration_verb(
             }
         }
         "add_column" | "change_column" => {
-            // Check an existing generated target before interpreting the
-            // requested type/options. Even an unknown replacement type
-            // must not bypass the explicit generated-column boundary.
-            if verb == "change_column" {
-                if let (Some(t), Some(c)) = (arg_name(0), arg_name(1)) {
-                    let targets_generated = schema
-                        .tables
-                        .get(&Symbol::from(t.as_str()))
-                        .is_some_and(|table| {
-                            table.columns.iter().any(|column| {
-                                column.name.as_str() == c.as_str()
-                                    && column.generated.is_some()
-                            })
-                        });
-                    if targets_generated {
-                        return Err(IngestError::Unsupported {
-                            file: file.into(),
-                            message: format!(
-                                "generated column changes are not supported: {t}.{c}"
-                            ),
-                        });
-                    }
-                }
-            }
             if let (Some(t), Some(c), Some(ty)) = (arg_name(0), arg_name(1), arg_name(2)) {
-                let option_args = &args[3..];
-                if has_column_option_splats(option_args) {
-                    return Err(IngestError::Unsupported {
-                        file: file.into(),
-                        message: format!(
-                            "column options for {t}.{c} cannot use keyword splats because generated-column metadata may be hidden"
-                        ),
-                    });
-                }
-                let generated_option = has_generated_column_options(option_args);
-                let generated = ty == "virtual" || generated_option;
-                let col = if generated {
-                    if verb == "change_column" {
-                        return Err(IngestError::Unsupported {
-                            file: file.into(),
-                            message: format!("generated column changes are not supported: {t}.{c}"),
-                        });
-                    }
-                    generated_column_from_options(
-                        c,
-                        &t,
-                        file,
-                        if ty == "virtual" { None } else { Some(&ty) },
-                        option_args,
-                    )?
-                } else {
-                    let opts = parse_column_opts(option_args.iter());
-                    column_with_type(&ty, c, &opts, &t, file)?
-                };
-                if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
-                    // This fold replaces a same-named column for both
-                    // verbs. Do not let an ordinary add/change erase the
-                    // generated expression and make the field writable.
-                    if col.generated.is_none()
-                        && table.columns.iter().any(|existing| {
-                            existing.name == col.name && existing.generated.is_some()
-                        })
-                    {
-                        return Err(IngestError::Unsupported {
-                            file: file.into(),
-                            message: format!(
-                                "generated column `{}.{}` cannot be replaced by an ordinary column with `{verb}`",
-                                t,
-                                col.name.as_str(),
-                            ),
-                        });
-                    }
-                    // Validate the replacement against the complete
-                    // candidate before changing the folded schema. This
-                    // keeps failed generated replacements (and ordinary
-                    // replacements that invalidate generated operands)
-                    // from erasing the previous metadata in survey mode.
-                    let mut candidate = table.clone();
-                    candidate.columns.retain(|existing| existing.name != col.name);
-                    candidate.columns.push(col.clone());
-                    if table.columns.iter().any(|column| column.generated.is_some())
-                        || col.generated.is_some()
-                    {
-                        validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
-                    }
-                }
-                // change_column replaces; add_column after a
-                // replace-shaped history stays idempotent.
-                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
-                    table.columns.retain(|x| x.name != col.name);
-                    table.columns.push(col);
-                }
+                fold_column(verb, &t, c, &ty, &args[3..], file, schema, dialect)?;
             }
         }
         "remove_column" => {
             if let (Some(t), Some(c)) = (arg_name(0), arg_name(1)) {
-                if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
-                    refuse_predicate_column(verb, table, &c, file)?;
-                    refuse_indexed_generated_column_mutation(verb, table, &c, file)?;
-                    if table.columns.iter().any(|column| column.generated.is_some()) {
-                        let mut candidate = table.clone();
-                        candidate.columns.retain(|column| column.name.as_str() != c);
-                        validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
-                    }
-                }
-                if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
-                    table.columns.retain(|x| x.name.as_str() != c);
-                }
+                remove_named_column(verb, &t, &c, file, schema, dialect)?;
             }
         }
         "rename_column" => {
@@ -477,8 +588,21 @@ fn apply_migration_verb(
         }
         "add_timestamps" => {
             if let Some(t) = arg_name(0) {
+                // Rails' `add_timestamps` makes both columns `null: false`
+                // unless the options say otherwise.
+                let opts = parse_column_opts(args.iter().skip(1));
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
-                    table.columns.extend(timestamp_columns());
+                    for col in timestamp_columns_with(opts.nullable.unwrap_or(false)) {
+                        table.columns.retain(|x| x.name != col.name);
+                        table.columns.push(col);
+                    }
+                }
+            }
+        }
+        "remove_timestamps" => {
+            if let Some(t) = arg_name(0) {
+                for c in ["created_at", "updated_at"] {
+                    remove_named_column(verb, &t, c, file, schema, dialect)?;
                 }
             }
         }
@@ -544,7 +668,13 @@ fn apply_migration_verb(
         }
         "remove_index" => {
             if let Some(t) = arg_name(0) {
-                let columns = args.get(1).map(column_name_list).unwrap_or_default();
+                // `remove_index :t, :col`, or `column:` / `name:` options.
+                let mut columns = args.get(1).map(column_name_list).unwrap_or_default();
+                if columns.is_empty() {
+                    columns = kwarg_value(args.iter().skip(1), "column")
+                        .map(|v| column_name_list(&v))
+                        .unwrap_or_default();
+                }
                 let by_name =
                     kwarg_value(args.iter().skip(1), "name").and_then(|v| string_value(&v));
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
@@ -557,13 +687,25 @@ fn apply_migration_verb(
                 }
             }
         }
+        "rename_index" => {
+            let index_name = |i: usize| args.get(i).and_then(name_value);
+            if let (Some(t), Some(old), Some(new)) = (arg_name(0), index_name(1), index_name(2)) {
+                if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+                    for index in &mut table.indexes {
+                        if index.name.as_str() == old {
+                            index.name = Symbol::from(new.as_str());
+                        }
+                    }
+                }
+            }
+        }
         // `add_foreign_key "comments", "articles"[, column:, primary_key:,
         // on_delete:, on_update:]` — recorded into `Table.foreign_keys` so
         // downstream consumers see the referential shape (the Roda/Sequel
         // conversion emits real `foreign_key` migration lines from it).
         // Column typing itself is unaffected: the FK column is already an
         // ordinary integer column from `create_table`.
-        "add_foreign_key" => apply_add_foreign_key(&args, schema),
+        "add_foreign_key" => apply_add_foreign_key(args, schema),
         // Extensions (and FK removal — schema.rb is canonical state, so
         // a remove would only appear in migration folds where the add is
         // also seen) don't affect column typing; skipped like before.
@@ -571,6 +713,343 @@ fn apply_migration_verb(
         // Anything else receiver-less is arbitrary migration Ruby
         // (`say`, backfill helpers) — not schema-affecting.
         _ => {}
+    }
+    Ok(())
+}
+
+/// `add_column`/`change_column` of one literal column, as either verb
+/// or `change_table`'s `t.<type>`, `t.column` and `t.change` spell it.
+#[allow(clippy::too_many_arguments)]
+fn fold_column(
+    verb: &str,
+    t: &str,
+    c: String,
+    ty: &str,
+    option_args: &[Node<'_>],
+    file: &str,
+    schema: &mut Schema,
+    dialect: GeneratedExpressionDialect,
+) -> Result<(), IngestError> {
+    // Check an existing generated target before interpreting the
+    // requested type/options. Even an unknown replacement type
+    // must not bypass the explicit generated-column boundary.
+    if verb == "change_column" {
+        let targets_generated = schema.tables.get(&Symbol::from(t)).is_some_and(|table| {
+            table
+                .columns
+                .iter()
+                .any(|column| column.name.as_str() == c.as_str() && column.generated.is_some())
+        });
+        if targets_generated {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("generated column changes are not supported: {t}.{c}"),
+            });
+        }
+    }
+    if has_column_option_splats(option_args) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "column options for {t}.{c} cannot use keyword splats because generated-column metadata may be hidden"
+            ),
+        });
+    }
+    let generated_option = has_generated_column_options(option_args);
+    let generated = ty == "virtual" || generated_option;
+    let col = if generated {
+        if verb == "change_column" {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("generated column changes are not supported: {t}.{c}"),
+            });
+        }
+        generated_column_from_options(c, t, file, if ty == "virtual" { None } else { Some(ty) }, option_args)?
+    } else {
+        let opts = parse_column_opts(option_args.iter());
+        let mut col = column_with_type(ty, c, &opts, t, file)?;
+        // Every Rails adapter's `change_column` keeps the column's
+        // nullability and default unless the call gives them (MySQL
+        // copies them into its `CHANGE`, PostgreSQL alters only the
+        // type, SQLite copies the old definition). A collation-only
+        // `t.change :title, :string, collation: "..."` must not make
+        // a `NOT NULL` column nullable. The key stays the key.
+        if verb == "change_column" {
+            let existing = schema
+                .tables
+                .get(&Symbol::from(t))
+                .and_then(|table| table.columns.iter().find(|x| x.name == col.name));
+            if let Some(existing) = existing {
+                if opts.nullable.is_none() {
+                    col.nullable = existing.nullable;
+                }
+                if !opts.default_given {
+                    col.default = existing.default.clone();
+                    col.default_function = existing.default_function;
+                }
+                col.primary_key = existing.primary_key;
+            }
+        }
+        col
+    };
+    if let Some(table) = schema.tables.get(&Symbol::from(t)) {
+        // This fold replaces a same-named column for both
+        // verbs. Do not let an ordinary add/change erase the
+        // generated expression and make the field writable.
+        if col.generated.is_none()
+            && table
+                .columns
+                .iter()
+                .any(|existing| existing.name == col.name && existing.generated.is_some())
+        {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "generated column `{}.{}` cannot be replaced by an ordinary column with `{verb}`",
+                    t,
+                    col.name.as_str(),
+                ),
+            });
+        }
+        // Validate the replacement against the complete
+        // candidate before changing the folded schema. This
+        // keeps failed generated replacements (and ordinary
+        // replacements that invalidate generated operands)
+        // from erasing the previous metadata in survey mode.
+        let mut candidate = table.clone();
+        candidate.columns.retain(|existing| existing.name != col.name);
+        candidate.columns.push(col.clone());
+        if table.columns.iter().any(|column| column.generated.is_some()) || col.generated.is_some() {
+            validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
+        }
+    }
+    if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+        match table.columns.iter().position(|x| x.name == col.name) {
+            // `change_column` redefines the column where it stands.
+            Some(at) if verb == "change_column" => table.columns[at] = col,
+            // add_column after a replace-shaped history stays idempotent.
+            _ => {
+                table.columns.retain(|x| x.name != col.name);
+                table.columns.push(col);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `remove_column` of one literal column (also `remove_timestamps` and
+/// `change_table`'s `t.remove`).
+fn remove_named_column(
+    verb: &str,
+    t: &str,
+    c: &str,
+    file: &str,
+    schema: &mut Schema,
+    dialect: GeneratedExpressionDialect,
+) -> Result<(), IngestError> {
+    if let Some(table) = schema.tables.get(&Symbol::from(t)) {
+        refuse_predicate_column(verb, table, c, file)?;
+        refuse_indexed_generated_column_mutation(verb, table, c, file)?;
+        if table.columns.iter().any(|column| column.generated.is_some()) {
+            let mut candidate = table.clone();
+            candidate.columns.retain(|column| column.name.as_str() != c);
+            validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
+        }
+    }
+    if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+        table.columns.retain(|x| x.name.as_str() != c);
+    }
+    Ok(())
+}
+
+/// `change_table :posts[, bulk: true] do |t| … end`. The block's
+/// argument is Rails' `ActiveRecord::ConnectionAdapters::Table`, whose
+/// methods are the top-level migration verbs with the table filled in:
+/// `t.change` is `change_column`, `t.string :a, :b` adds two string
+/// columns, `t.remove :a` is `remove_column`, `t.timestamps` is
+/// `add_timestamps`. Each call folds through the verb it stands for, in
+/// block order, so both spellings share one semantics. `bulk: true`
+/// combines the ALTERs into one statement and changes nothing the fold
+/// models.
+fn apply_change_table(
+    call: &ruby_prism::CallNode<'_>,
+    args: &[Node<'_>],
+    file: &str,
+    schema: &mut Schema,
+    dialect: GeneratedExpressionDialect,
+) -> Result<(), IngestError> {
+    let unsupported = |message: &str| IngestError::Unsupported {
+        file: file.into(),
+        message: format!("migration `change_table` {message}; the schema fold cannot apply it"),
+    };
+    if args.first().and_then(table_name_value).is_none() {
+        return Err(unsupported("argument 1 is not a literal name"));
+    }
+    let Some(block) = call.block().and_then(|node| node.as_block_node()) else {
+        return Err(unsupported("has no literal block"));
+    };
+    if block.parameters().is_none() {
+        // No `|t|`: nothing in the block can reach the table.
+        return Ok(());
+    }
+    let Some(parameter) = block_parameter_name(&block) else {
+        return Err(unsupported("block does not take one plain parameter"));
+    };
+    let Some(body) = block.body() else { return Ok(()) };
+    let mut result = Ok(());
+    walk_calls(&body, &mut |inner| {
+        if result.is_err() {
+            return;
+        }
+        let on_table = inner
+            .receiver()
+            .and_then(|receiver| receiver.as_local_variable_read_node())
+            .is_some_and(|receiver| constant_id_str(&receiver.name()) == parameter);
+        if on_table {
+            result = apply_table_method(call, inner, file, schema, dialect);
+        }
+    });
+    result
+}
+
+/// The name of a block's single plain parameter (`do |t|`).
+fn block_parameter_name(block: &ruby_prism::BlockNode<'_>) -> Option<String> {
+    let parameters = block.parameters()?.as_block_parameters_node()?.parameters()?;
+    let requireds: Vec<Node<'_>> = parameters.requireds().iter().collect();
+    let [only] = requireds.as_slice() else { return None };
+    let plain = parameters.optionals().iter().next().is_none()
+        && parameters.rest().is_none()
+        && parameters.posts().iter().next().is_none()
+        && parameters.keywords().iter().next().is_none()
+        && parameters.keyword_rest().is_none();
+    plain.then(|| only.as_required_parameter_node().map(|p| constant_id_str(&p.name()).to_string()))?
+}
+
+/// One `t.<method>(…)` inside `change_table`, folded as the migration
+/// verb Rails' `Table` delegates it to (activerecord's
+/// `connection_adapters/abstract/schema_definitions.rb`).
+fn apply_table_method<'pr>(
+    change_table: &ruby_prism::CallNode<'pr>,
+    inner: &ruby_prism::CallNode<'pr>,
+    file: &str,
+    schema: &mut Schema,
+    dialect: GeneratedExpressionDialect,
+) -> Result<(), IngestError> {
+    let method = constant_id_str(&inner.name()).to_string();
+    let table = call_arguments(change_table)
+        .first()
+        .and_then(table_name_value)
+        .expect("apply_change_table checked the table name");
+    // The verb's arguments: the table, then the call's own.
+    let with_table = |rest: Vec<Node<'pr>>| {
+        let mut args: Vec<Node<'pr>> = call_arguments(change_table).into_iter().take(1).collect();
+        args.extend(rest);
+        args
+    };
+    // `Table`'s `*names, **options` methods apply once per name, each
+    // with every option: `t.remove :a, :b` is two `remove_column`s.
+    let positions: Vec<usize> = call_arguments(inner)
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_keyword_hash_node().is_none())
+        .map(|(at, _)| at)
+        .collect();
+    let per_name = |at: usize| {
+        let (mut name, mut options) = (Vec::new(), Vec::new());
+        for (i, arg) in call_arguments(inner).into_iter().enumerate() {
+            if i == at {
+                name.push(arg);
+            } else if arg.as_keyword_hash_node().is_some() {
+                options.push(arg);
+            }
+        }
+        (name, options)
+    };
+    let delegate = |verb: &str, schema: &mut Schema| {
+        apply_table_verb(verb, &with_table(call_arguments(inner)), file, schema, dialect)
+    };
+    match method.as_str() {
+        "change" => delegate("change_column", schema),
+        "change_default" => delegate("change_column_default", schema),
+        "change_null" => delegate("change_column_null", schema),
+        "rename" => delegate("rename_column", schema),
+        "index" => delegate("add_index", schema),
+        "remove_index" => delegate("remove_index", schema),
+        "rename_index" => delegate("rename_index", schema),
+        "timestamps" => delegate("add_timestamps", schema),
+        "remove_timestamps" => delegate("remove_timestamps", schema),
+        "foreign_key" => delegate("add_foreign_key", schema),
+        "column" => {
+            delegate("add_column", schema)?;
+            let args = call_arguments(inner);
+            match args.first().and_then(name_value) {
+                Some(column) => add_column_index(&table, &column, &args[1..], file, schema),
+                None => Ok(()),
+            }
+        }
+        "remove" | "references" | "belongs_to" | "remove_references" | "remove_belongs_to" => {
+            let verb = match method.as_str() {
+                "remove" => "remove_column",
+                "references" | "belongs_to" => "add_reference",
+                _ => "remove_reference",
+            };
+            for at in positions {
+                let (name, options) = per_name(at);
+                let mut rest = name;
+                rest.extend(options);
+                apply_table_verb(verb, &with_table(rest), file, schema, dialect)?;
+            }
+            Ok(())
+        }
+        // Questions about the table, and constraints the fold does not
+        // model (a constraint costs the DDL nothing; `remove_foreign_key`
+        // is skipped like the top-level verb).
+        "name" | "column_exists?" | "index_exists?" | "foreign_key_exists?"
+        | "check_constraint_exists?" | "remove_foreign_key" | "check_constraint"
+        | "remove_check_constraint" | "validate_check_constraint" | "validate_constraint"
+        | "unique_constraint" | "remove_unique_constraint" | "exclusion_constraint"
+        | "remove_exclusion_constraint" => Ok(()),
+        // Everything else is a column type: `t.string :title, null:
+        // false` is `add_column :posts, :title, :string, null: false`,
+        // and a type the fold cannot map errors as in `create_table`.
+        column_type => {
+            for at in positions {
+                let (name, options) = per_name(at);
+                let Some(column) = name.first().and_then(name_value) else {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!(
+                            "migration `change_table` `t.{column_type}` argument {} is not a literal name; the schema fold cannot apply it",
+                            at + 1
+                        ),
+                    });
+                };
+                fold_column("add_column", &table, column.clone(), column_type, &options, file, schema, dialect)?;
+                add_column_index(&table, &column, &options, file, schema)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A column `change_table` adds with `index: true` (or `index: { … }`)
+/// gets an index on it, as `Table#column` adds one.
+fn add_column_index(
+    table: &str,
+    column: &str,
+    options: &[Node<'_>],
+    file: &str,
+    schema: &mut Schema,
+) -> Result<(), IngestError> {
+    let Some(value) = kwarg_value(options.iter(), "index") else { return Ok(()) };
+    if value.as_nil_node().is_some() || bool_value(&value) == Some(false) {
+        return Ok(());
+    }
+    let index = build_index(table, vec![Symbol::from(column)], std::iter::once(&value), file)?;
+    if let Some(table) = schema.tables.get_mut(&Symbol::from(table)) {
+        if table.columns.iter().any(|col| col.name.as_str() == column) {
+            table.indexes.push(index);
+        }
     }
     Ok(())
 }
@@ -861,8 +1340,13 @@ fn build_index<'pr>(
     let mut using: Option<String> = None;
     let mut predicate: Option<String> = None;
     for node in kwarg_nodes {
-        let Some(kh) = node.as_keyword_hash_node() else { continue };
-        for el in kh.elements().iter() {
+        // Keyword options, or the hash `index: { unique: true }` names.
+        let elements = match (node.as_keyword_hash_node(), node.as_hash_node()) {
+            (Some(hash), _) => hash.elements(),
+            (None, Some(hash)) => hash.elements(),
+            (None, None) => continue,
+        };
+        for el in elements.iter() {
             let Some(assoc) = el.as_assoc_node() else { continue };
             let Some(key) = symbol_value(&assoc.key()) else { continue };
             let value = &assoc.value();
@@ -1061,7 +1545,8 @@ fn table_from_create_table(
                         } else if call_name == "timestamps" {
                             // Migration macro; schema.rb has these
                             // already materialized as two datetimes.
-                            columns.extend(timestamp_columns());
+                            let opts = parse_column_opts(call_arguments(&call).iter());
+                            columns.extend(timestamp_columns_with(opts.nullable.unwrap_or(false)));
                         } else {
                             match column_from_call(&call, &table_name, file) {
                                 Ok(Some(cols)) => columns.extend(cols),
@@ -1327,13 +1812,13 @@ fn view_column_type(name: &str) -> ColumnType {
     }
 }
 
-/// The two columns `t.timestamps` expands to (Rails 5+ default:
-/// `null: false`, no default value).
-fn timestamp_columns() -> [Column; 2] {
+/// The two columns `t.timestamps` / `add_timestamps` add. Rails 5+
+/// makes them `null: false` unless `null:` says otherwise; no default.
+fn timestamp_columns_with(nullable: bool) -> [Column; 2] {
     let col = |name: &str| Column {
         name: Symbol::from(name),
         col_type: ColumnType::DateTime,
-        nullable: false,
+        nullable,
         default: None,
         primary_key: false,
         generated: None,
@@ -1350,6 +1835,9 @@ fn timestamp_columns() -> [Column; 2] {
 struct ColumnOpts {
     nullable: Option<bool>,
     default: Option<String>,
+    /// Whether `default:` was given at all (`default: nil` included):
+    /// `change_column` keeps the old default only when it was not.
+    default_given: bool,
     limit: Option<u32>,
     /// A decimal's `precision:` and `scale:`.
     precision: Option<u8>,
@@ -1383,7 +1871,10 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
             let value = &assoc.value();
             match key.as_str() {
                 "null" => opts.nullable = bool_value(value),
-                "default" => opts.default = default_value(value),
+                "default" => {
+                    opts.default_given = true;
+                    opts.default = default_value(value);
+                }
                 "polymorphic" => opts.polymorphic = bool_value(value) == Some(true),
                 "type" => opts.type_name = name_value(value),
                 "limit" => {
@@ -2260,6 +2751,287 @@ mod tests {
                 ("widened", &ColumnType::BigInt),
             ]
         );
+    }
+
+    fn col<'s>(schema: &'s Schema, table: &str, name: &str) -> &'s Column {
+        schema.tables[&Symbol::from(table)]
+            .columns
+            .iter()
+            .find(|c| c.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{table}.{name}"))
+    }
+
+    const CREATE_POSTS: &str = r#"
+        class CreatePosts < ActiveRecord::Migration[8.1]
+          def change
+            create_table :posts do |t|
+              t.string :title, limit: 64, null: false, default: ""
+              t.text :body
+              t.string :legacy
+              t.string :obsolete
+              t.integer :views
+            end
+          end
+        end
+    "#;
+
+    /// The bulk form of a charset/collation change: `t.change` is
+    /// `change_column`, which keeps the column's nullability, default
+    /// and position unless the call gives them.
+    #[test]
+    fn change_table_change_keeps_null_default_and_position() {
+        let schema = fold(&[
+            CREATE_POSTS,
+            r#"
+            class PostsToBinaryCollation < ActiveRecord::Migration[8.1]
+              def change
+                change_table(:posts, bulk: true) do |t|
+                  t.change(:title, :string, collation: "utf8mb4_bin", limit: 64)
+                  t.change :body, :text, collation: "utf8mb4_bin"
+                end
+                change_table :posts do |t|
+                  t.change :views, :bigint
+                end
+              end
+            end
+            "#,
+        ]);
+        assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "legacy", "obsolete", "views"]);
+        let title = col(&schema, "posts", "title");
+        assert_eq!(title.col_type, ColumnType::String { limit: Some(64) });
+        assert!(!title.nullable, "a collation change keeps NOT NULL");
+        assert_eq!(title.default.as_deref(), Some(""), "and the default");
+        assert_eq!(col(&schema, "posts", "views").col_type, ColumnType::BigInt);
+        assert!(col(&schema, "posts", "id").primary_key);
+    }
+
+    /// `change_column` itself: given options win, `default: nil`
+    /// clears, and changing the key keeps it the key.
+    #[test]
+    fn change_column_replaces_only_what_it_names() {
+        let schema = fold(&[
+            CREATE_POSTS,
+            r#"
+            class Retype < ActiveRecord::Migration[8.1]
+              def change
+                change_column :posts, :title, :text
+                change_table :posts do |t|
+                  t.change :legacy, :string, null: false, default: "x"
+                end
+              end
+            end
+            "#,
+            r#"
+            class Relax < ActiveRecord::Migration[8.1]
+              def change
+                change_column :posts, :legacy, :string, null: true, default: nil
+                change_column :posts, :id, :bigint
+              end
+            end
+            "#,
+        ]);
+        let title = col(&schema, "posts", "title");
+        assert_eq!(title.col_type, ColumnType::Text);
+        assert!(!title.nullable);
+        assert_eq!(title.default.as_deref(), Some(""));
+        let legacy = col(&schema, "posts", "legacy");
+        assert!(legacy.nullable);
+        assert_eq!(legacy.default, None);
+        assert!(col(&schema, "posts", "id").primary_key);
+    }
+
+    /// Every `Table` method that changes the schema folds as the verb it
+    /// delegates to; `*names` methods apply once per name.
+    #[test]
+    fn change_table_folds_each_table_method_as_its_verb() {
+        let schema = fold(&[
+            CREATE_POSTS,
+            r#"
+            class ReworkPosts < ActiveRecord::Migration[8.1]
+              def change
+                change_table :posts, bulk: true do |t|
+                  t.string :slug, :subtitle, null: false, default: "", index: { unique: true }
+                  t.bigint :author_id, null: true
+                  t.column :score, :decimal, precision: 5, scale: 2, index: true
+                  t.remove :legacy, :obsolete
+                  t.rename :body, :content
+                  t.change_default :views, from: nil, to: 0
+                  t.change_null :score, false
+                  t.references :editor, polymorphic: true, null: false
+                  t.belongs_to :reviewer
+                  t.timestamps null: true
+                  t.index :views, name: "by_views"
+                  t.rename_index "by_views", "posts_by_views"
+                  t.check_constraint "views >= 0", name: "views_non_negative"
+                  t.remove_check_constraint name: "views_non_negative" if t.column_exists?(:views)
+                end
+              end
+            end
+            "#,
+        ]);
+        assert_eq!(
+            col_names(&schema, "posts"),
+            [
+                "id", "title", "content", "views", "slug", "subtitle", "author_id", "score",
+                "editor_id", "editor_type", "reviewer_id", "created_at", "updated_at",
+            ]
+        );
+        assert!(!col(&schema, "posts", "slug").nullable && !col(&schema, "posts", "subtitle").nullable);
+        assert!(col(&schema, "posts", "author_id").nullable);
+        assert_eq!(col(&schema, "posts", "author_id").col_type, ColumnType::BigInt);
+        let score = col(&schema, "posts", "score");
+        assert_eq!(score.col_type, ColumnType::Decimal { precision: Some(5), scale: Some(2) });
+        assert!(!score.nullable, "change_null :score, false");
+        assert_eq!(col(&schema, "posts", "views").default.as_deref(), Some("0"));
+        assert!(matches!(col(&schema, "posts", "editor_id").col_type, ColumnType::Reference { .. }));
+        assert!(!col(&schema, "posts", "editor_type").nullable);
+        assert!(col(&schema, "posts", "reviewer_id").nullable);
+        assert!(col(&schema, "posts", "created_at").nullable, "timestamps null: true");
+        let indexes: Vec<(&str, Vec<&str>, bool)> = schema.tables[&Symbol::from("posts")]
+            .indexes
+            .iter()
+            .map(|i| (i.name.as_str(), i.columns.iter().map(|c| c.as_str()).collect(), i.unique))
+            .collect();
+        assert_eq!(
+            indexes,
+            [
+                ("index_posts_on_slug", vec!["slug"], true),
+                ("index_posts_on_subtitle", vec!["subtitle"], true),
+                ("index_posts_on_score", vec!["score"], false),
+                ("posts_by_views", vec!["views"], false),
+            ]
+        );
+    }
+
+    #[test]
+    fn change_table_removes_references_timestamps_and_indexes() {
+        let schema = fold(&[
+            CREATE_POSTS,
+            r#"
+            class Grow < ActiveRecord::Migration[8.1]
+              def change
+                change_table :posts do |t|
+                  t.references :editor, polymorphic: true
+                  t.timestamps
+                  t.index :title
+                  t.index :views, name: "by_views"
+                  t.index [:title, :views]
+                end
+              end
+            end
+            "#,
+            r#"
+            class Shrink < ActiveRecord::Migration[8.1]
+              def change
+                change_table :posts do |t|
+                  t.remove_references :editor, polymorphic: true
+                  t.remove_timestamps
+                  t.remove_index :title
+                  t.remove_index name: "by_views"
+                  t.remove_index column: [:title, :views]
+                end
+              end
+            end
+            "#,
+        ]);
+        assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "legacy", "obsolete", "views"]);
+        assert!(schema.tables[&Symbol::from("posts")].indexes.is_empty());
+    }
+
+    /// What `change_table` cannot apply is a gap, as for the top-level
+    /// verbs: a name that is not a literal, or a type with no mapping.
+    #[test]
+    fn change_table_reports_what_it_cannot_apply() {
+        let attempt = |body: &str| {
+            let mut schema = fold(&[CREATE_POSTS]);
+            let source = format!(
+                "class Change < ActiveRecord::Migration[8.1]\n  def change\n{body}\n  end\nend\n"
+            );
+            ingest_migration(source.as_bytes(), "2_change.rb", &mut schema).map(|()| schema)
+        };
+        let message = |body: &str| attempt(body).expect_err(body).to_string();
+        assert!(message("change_table(table_name) { |t| t.remove :legacy }").contains("`change_table` argument 1 is not a literal name"));
+        assert!(message("change_table :posts do |t|\n  %i[legacy obsolete].each { |c| t.change c, :text }\nend")
+            .contains("`change_column` argument 2 is not a literal name"));
+        assert!(message("change_table :posts do |t|\n  t.string name\nend").contains("`t.string` argument 1 is not a literal name"));
+        assert!(message("change_table :posts do |t|\n  t.hstore :settings\nend").contains("unsupported type `hstore`"));
+        assert!(message("change_table(:posts, &block)").contains("has no literal block"));
+        let schema = attempt("change_table :posts do |t|\n  say \"nothing to see\"\nend").expect("no table call");
+        assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "legacy", "obsolete", "views"]);
+    }
+
+    /// The tail of a charset migration: the columns change through
+    /// `change_table`, then raw SQL moves the table's own default.
+    /// Table options change nothing the fold models, in any spelling.
+    #[test]
+    fn execute_of_table_charset_and_collation_changes_folds() {
+        let schema = fold(&[
+            CREATE_POSTS,
+            r#"
+            class PostsToBinaryCollation < ActiveRecord::Migration[8.1]
+              def up
+                change_table(:posts, bulk: true) do |t|
+                  t.change(:title, :string, limit: 64, null: false, collation: "utf8mb4_bin")
+                end
+                execute("ALTER TABLE posts COLLATE=utf8mb4_bin")
+                execute "alter table `posts` default charset = utf8mb4, collate 'utf8mb4_bin';", "posts collation"
+                execute <<~SQL
+                  -- the table default, then every string column
+                  ALTER TABLE app.posts DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE = utf8mb4_bin;
+                  ALTER TABLE "posts" /* the default */ CHARSET utf8mb4;
+                SQL
+                execute <<-SQL
+                  ALTER TABLE never_created COLLATE utf8mb4_bin
+                SQL
+              end
+            end
+            "#,
+        ]);
+        assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "legacy", "obsolete", "views"]);
+        let title = col(&schema, "posts", "title");
+        assert_eq!(title.col_type, ColumnType::String { limit: Some(64) });
+        assert!(!title.nullable);
+        assert_eq!(col(&schema, "posts", "body").col_type, ColumnType::Text);
+        assert!(!schema.tables.contains_key(&Symbol::from("never_created")));
+    }
+
+    /// Any other SQL stays a gap naming the verb and the statement, so
+    /// a column added, dropped or redefined in raw SQL is never missed.
+    #[test]
+    fn execute_reports_sql_it_cannot_prove_changes_nothing() {
+        let message = |body: &str| {
+            let mut schema = fold(&[CREATE_POSTS]);
+            let source = format!("class Raw < ActiveRecord::Migration[8.1]\n  def up\n{body}\n  end\nend\n");
+            let message = ingest_migration(source.as_bytes(), "2_raw.rb", &mut schema).expect_err(body).to_string();
+            assert!(message.contains("migration verb `execute`"), "names the verb: {message}");
+            assert!(message.contains("rails db:migrate"), "points at the fix: {message}");
+            message
+        };
+        for body in [
+            r#"execute "ALTER TABLE posts ADD COLUMN slug varchar(255)""#,
+            r#"execute "ALTER TABLE posts MODIFY title varchar(64) COLLATE utf8mb4_bin""#,
+            r#"execute "ALTER TABLE posts DROP PRIMARY KEY, ADD PRIMARY KEY (title)""#,
+            r#"execute "ALTER TABLE posts COLLATE=utf8mb4_bin, DROP COLUMN legacy""#,
+            r#"execute "ALTER TABLE posts COLLATE=utf8mb4_bin; DROP TABLE posts""#,
+            r#"execute "ALTER TABLE posts /*!50100 DROP COLUMN legacy */ COLLATE=utf8mb4_bin""#,
+            r#"execute "ALTER TABLE posts COLLATE=""#,
+            r#"execute "ALTER TABLE posts COLLATE=utf8mb4_bin,""#,
+            r#"execute "ALTER TABLE posts CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin""#,
+            r#"execute "ALTER TABLE posts""#,
+            r#"execute "UPDATE posts SET views = 0""#,
+        ] {
+            assert!(message(body).contains("runs `"), "quotes the SQL: {body}");
+        }
+        assert!(message("execute \"ALTER TABLE posts ADD COLUMN slug varchar(255)\"")
+            .contains("runs `ALTER TABLE posts ADD COLUMN slug varchar(255)`"));
+        for body in [
+            r#"execute "ALTER TABLE #{table} COLLATE=utf8mb4_bin""#,
+            "execute sql",
+            "execute <<~SQL.squish\n  ALTER TABLE posts COLLATE=utf8mb4_bin\nSQL",
+            "execute",
+        ] {
+            assert!(message(body).contains("is not given a literal SQL string"), "{body}");
+        }
     }
 
     #[test]

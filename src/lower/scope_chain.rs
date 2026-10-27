@@ -4079,13 +4079,13 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
 // the Ruby emitter writes back as `blank?`; losing it left
 // `strip` on a uuid attribute that holds an Integer).
 let kept = match &*expr.node {
-    ExprNode::Send { method, .. } => expr.hint.clone().map(|hint| (method.clone(), hint)),
+    ExprNode::Send { method, .. } => expr.hint().clone().map(|hint| (method.clone(), hint)),
     _ => None,
 };
 let model = rewrite_send(expr, ctx, locals);
 if let Some((method, hint)) = kept {
-    if expr.hint.is_none() && matches!(&*expr.node, ExprNode::Send { method: m, .. } if *m == method) {
-        expr.hint = Some(hint);
+    if expr.hint().is_none() && matches!(&*expr.node, ExprNode::Send { method: m, .. } if *m == method) {
+        expr.set_hint(Some(hint));
     }
 }
 crate::lower::relation_counted_terminal::rewrite_count_gt_when(expr, |rel| {

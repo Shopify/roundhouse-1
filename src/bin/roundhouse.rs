@@ -344,7 +344,11 @@ fn transpile(
     let mut survey_gaps =
         if survey { roundhouse::ingest::survey::drain() } else { Vec::new() };
     let mut app = match app_result {
-        Ok(app) => app,
+        Ok(app) => {
+            #[cfg(feature = "memory-census")]
+            roundhouse::memory_census::census("after ingest", &app);
+            app
+        }
         Err(e) => {
             // Ingest failed outright. Surface any syntax errors first: a
             // malformed file is usually the root cause of the construct
@@ -635,6 +639,16 @@ fn transpile(
     // Gate passed (or every error was downgraded): materialize the emit
     // output, propagating any hard emit failure now.
     let files = files_result?;
+    #[cfg(feature = "memory-census")]
+    roundhouse::memory_census::note(
+        "after emit",
+        format_args!(
+            "{} files, {:.1}MB of text held before writing; live heap {:.1}MB",
+            files.len(),
+            files.iter().map(|(path, content)| path.len() + content.len()).sum::<usize>() as f64 / 1e6,
+            roundhouse::memory_census::live_bytes() as f64 / 1e6,
+        ),
+    );
     roundhouse::timings::phase("write: text files", || project::write_to_dir(&files, out))?;
     // The app's own binary files — images, fonts, binary test fixtures.
     // They never became `EmittedFile`s (that type's content is a

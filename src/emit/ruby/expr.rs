@@ -324,13 +324,13 @@ fn diagnostic_stub(e: &Expr) -> Option<String> {
     // declaration's diagnostic, and `project` refuses it on every tree
     // but CRuby's.
     let runtime_declared_type = e.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0
-        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if matches!(construct.as_str(), "declared type" | "constant"));
+        && matches!(&e.diagnostic(), Some(DiagnosticKind::Unsupported { construct, .. }) if matches!(construct.as_str(), "declared type" | "constant"));
     // A constructor call refused only for ingest's flattened keywords
     // (`CONSTRUCTOR_KEYWORDS_AS_WRITTEN`): this tree writes them back, so
     // the source call runs.
     let constructor_as_written = e.decisions & crate::expr::CONSTRUCTOR_KEYWORDS_AS_WRITTEN != 0
         && native_keywords()
-        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS);
+        && matches!(&e.diagnostic(), Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS);
     // A `define_method` statement the static expansion refused
     // (`ingest::define_method_loops`): the refusal is about expanding it
     // into `def`s for tools that cannot run it. CRuby runs `define_method`
@@ -338,9 +338,9 @@ fn diagnostic_stub(e: &Expr) -> Option<String> {
     // strict targets still report the diagnostic.
     let define_method_as_written = native_keywords()
         && e.decisions & crate::expr::CLASS_METHODS_BLOCK_STATEMENT == 0
-        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == crate::ingest::DEFINE_METHOD_REFUSAL);
+        && matches!(&e.diagnostic(), Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == crate::ingest::DEFINE_METHOD_REFUSAL);
     if let Some(kind @ DiagnosticKind::Unsupported { .. }) = &e
-        .diagnostic
+        .diagnostic()
         .as_ref()
         .filter(|_| !runtime_declared_type && !constructor_as_written && !define_method_as_written)
     {
@@ -353,7 +353,7 @@ fn diagnostic_stub(e: &Expr) -> Option<String> {
     // A statement ingest refused (`ingest_statement_list`). NotImplementedError
     // is a ScriptError, so an app's `rescue => e` does not swallow the gap.
     // Single-quoted: the detail quotes source, which may hold `#{`.
-    if let Some(kind @ DiagnosticKind::IngestRefused { .. }) = &e.diagnostic {
+    if let Some(kind @ DiagnosticKind::IngestRefused { .. }) = &e.diagnostic() {
         let text = format!("roundhouse: {}", crate::diagnostic::Diagnostic::stub_text(kind));
         let quoted = text.replace('\\', "\\\\").replace('\'', "\\'");
         return Some(format!("(::Kernel.raise(::NotImplementedError, '{quoted}'))"));
@@ -509,7 +509,7 @@ fn rooted_resolved_head(path: &[crate::Symbol], resolved: &str) -> Option<String
 /// the `strip.empty?`, which has no `String#blank?` to send to (see
 /// `lower::blank`).
 fn rails_string_blank(e: &Expr) -> Option<String> {
-    if e.hint != Some(crate::expr::IrHint::StringBlank) || !native_keywords() {
+    if e.hint() != &Some(crate::expr::IrHint::StringBlank) || !native_keywords() {
         return None;
     }
     let ExprNode::Send { recv: Some(strip), method, args, block: None, .. } = &*e.node else { return None };
@@ -555,7 +555,7 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
     }
     // The lowered read of a call routed to the port: the port answers the
     // call as written (`lower::errors_index::port_form`).
-    if let Some(crate::expr::IrHint::ErrorsPortOriginal(original)) = &e.hint {
+    if let Some(crate::expr::IrHint::ErrorsPortOriginal(original)) = &e.hint() {
         return Some(emit_expr(&original.0));
     }
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { return None };
@@ -671,7 +671,7 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
         written.extend(args.iter().map(emit_arg));
         format!("ActiveModel::ErrorAttributes.{name}({})", written.join(", "))
     };
-    match (e.hint.as_ref(), method.as_str(), args.as_slice()) {
+    match (e.hint().as_ref(), method.as_str(), args.as_slice()) {
         (Some(IrHint::ErrorAttribute(ErrorTag { attribute, short, detail })), "<<", [msg]) => Some(push(
             emit_node(&ExprNode::Lit { value: crate::expr::Literal::Sym { value: attribute.clone() } }),
             msg,
@@ -730,7 +730,7 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
 /// has, where the reader loads. Each model answers `association` there
 /// (`library::apply_association_reader`, which counts these reads).
 fn association_target(e: &Expr) -> Option<String> {
-    if e.hint != Some(crate::expr::IrHint::AssociationTarget) || !native_keywords() {
+    if e.hint() != &Some(crate::expr::IrHint::AssociationTarget) || !native_keywords() {
         return None;
     }
     let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node else { return None };
@@ -767,7 +767,7 @@ fn singular_builder(e: &Expr) -> Option<String> {
     }
     let ExprNode::Send { args, .. } = &*e.node else { return None };
     let [attrs] = args.as_slice() else { return None };
-    let Some(crate::expr::IrHint::SingularBuilder { method, synthesized }) = &attrs.hint else { return None };
+    let Some(crate::expr::IrHint::SingularBuilder { method, synthesized }) = &attrs.hint() else { return None };
     let ExprNode::Hash { entries, .. } = &*attrs.node else { return None };
     let owner = match &entries.first()?.1.node.as_ref() {
         // `<recv>.id`, or `<recv>.<primary_key:>` the association names.
@@ -792,7 +792,7 @@ fn singular_builder(e: &Expr) -> Option<String> {
 fn is_locked_external_gem_constant(expr: &Expr) -> bool {
     let Some(DiagnosticKind::Unsupported {
         construct, detail, ..
-    }) = &expr.diagnostic
+    }) = &expr.diagnostic()
     else {
         return false;
     };
@@ -811,7 +811,7 @@ fn is_locked_external_gem_constant(expr: &Expr) -> bool {
 /// `+`: spinel freezes a bare literal, and the source made this copy
 /// because it mutates it.
 fn is_mutable_string_literal(e: &Expr) -> bool {
-    e.hint == Some(crate::expr::IrHint::MutableStringLiteral)
+    e.hint() == &Some(crate::expr::IrHint::MutableStringLiteral)
         && matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } })
 }
 
@@ -933,7 +933,7 @@ fn emit_seq(exprs: &[Expr], value_used: bool) -> String {
 /// `e` renders as its node alone: `emit_expr` adds nothing around it
 /// (no stub for a diagnostic, no decision- or hint-driven rewrite).
 fn is_plain_statement(e: &Expr) -> bool {
-    e.diagnostic.is_none() && e.decisions == 0 && e.hint.is_none()
+    e.diagnostic().is_none() && e.decisions == 0 && e.hint().is_none()
 }
 
 /// Evaluating `e` does nothing: a local, ivar or `self` read, or a
@@ -3476,11 +3476,11 @@ mod tests {
         use crate::expr::{ErrorDetail, ErrorShort, ErrorTag, IrHint};
         let message = seq(vec![assign("tmp", send(None, "compute", vec![])), lit_str("text")]);
         let mut push = send(Some(var("errors")), "<<", vec![message]);
-        push.hint = Some(IrHint::ErrorAttribute(ErrorTag {
+        push.set_hint(Some(IrHint::ErrorAttribute(ErrorTag {
             attribute: Symbol::from("base"),
             short: ErrorShort::After(String::new()),
             detail: ErrorDetail::Message,
-        }));
+        })));
         let emitted = with_error_attributes(true, || emit_expr(&push));
         assert!(
             emitted.starts_with("ActiveModel::ErrorAttributes.add(errors, :base, (tmp = compute\n\"text\"), \"\""),

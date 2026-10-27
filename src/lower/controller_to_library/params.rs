@@ -1444,10 +1444,8 @@ fn synth_params_initialize(spec: &ParamsSpec) -> MethodDef {
                         ty: Some(Ty::Bool),
                         effects: EffectSet::default(),
                         leading_blank_line: false,
-                        diagnostic: None,
-                        hint: None,
+                        cold: None,
                         decisions: 0,
-                        keyword_arg: None,
                     },
                 },
             ));
@@ -1469,10 +1467,8 @@ fn synth_params_initialize(spec: &ParamsSpec) -> MethodDef {
             ty: Some(Ty::Nil),
             effects: EffectSet::default(),
             leading_blank_line: false,
-            diagnostic: None,
-            hint: None,
+            cold: None,
             decisions: 0,
-            keyword_arg: None,
         });
     }
     let body = Expr {
@@ -1481,10 +1477,8 @@ fn synth_params_initialize(spec: &ParamsSpec) -> MethodDef {
         ty: Some(Ty::Nil),
         effects: EffectSet::default(),
         leading_blank_line: false,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
-        keyword_arg: None,
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Private,
@@ -1517,10 +1511,8 @@ fn synth_attr_reader(owner: &ClassId, field: &Symbol, ty: Ty) -> MethodDef {
         ty: Some(field_ty.clone()),
         effects: EffectSet::default(),
         leading_blank_line: false,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
-        keyword_arg: None,
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -1625,10 +1617,8 @@ fn synth_attr_writer(owner: &ClassId, field: &Symbol, ty: Ty) -> MethodDef {
         ty: Some(field_ty.clone()),
         effects: EffectSet::default(),
         leading_blank_line: false,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
-        keyword_arg: None,
     };
     let body = Expr {
         span: Span::synthetic(),
@@ -1639,10 +1629,8 @@ fn synth_attr_writer(owner: &ClassId, field: &Symbol, ty: Ty) -> MethodDef {
         ty: Some(field_ty.clone()),
         effects: EffectSet::default(),
         leading_blank_line: false,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
-        keyword_arg: None,
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -2027,10 +2015,8 @@ fn expr(node: ExprNode, ty: Option<Ty>) -> Expr {
         ty,
         effects: EffectSet::default(),
         leading_blank_line: false,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
-        keyword_arg: None,
     }
 }
 
@@ -2084,10 +2070,8 @@ fn synth_to_h(spec: &ParamsSpec) -> MethodDef {
         ty: Some(hash_ty.clone()),
         effects: EffectSet::default(),
         leading_blank_line: false,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
-        keyword_arg: None,
     };
     let ret_ty = hash_ty;
     MethodDef {
@@ -2593,9 +2577,7 @@ fn try_rewrite_typed_bracket(
         ty: Some(slot_ty.clone()),
         effects: e.effects.clone(),
         leading_blank_line: e.leading_blank_line,
-        diagnostic: None,
-        hint: None,
+        cold: None,
         decisions: 0,
-        keyword_arg: None,
     })
 }

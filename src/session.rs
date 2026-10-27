@@ -44,9 +44,17 @@ pub fn analyze_and_lower(app: &mut App) -> Vec<Diagnostic> {
     crate::lower::i18n_translate::with_plan_cache(|| {
         let mut analyzer = crate::analyze::Analyzer::new(app);
         analyzer.analyze(app);
+        #[cfg(feature = "memory-census")]
+        crate::memory_census::census("after analyze", app);
         app.helper_diagnostics = Some(crate::analyze::diagnose_helper_modules(app));
-        crate::timings::phase("post-analyze lowerings", || {
+        let diagnostics = crate::timings::phase("post-analyze lowerings", || {
             crate::lower::apply_post_analyze_lowerings(app, analyzer.class_registry())
-        })
+        });
+        #[cfg(feature = "memory-census")]
+        if crate::memory_census::enabled() {
+            analyzer.census_drop();
+            crate::memory_census::census("after lowerings", app);
+        }
+        diagnostics
     })
 }

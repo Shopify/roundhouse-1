@@ -688,7 +688,7 @@ fn count_var_assignments(e: &Expr, out: &mut HashMap<Symbol, usize>) {
         ExprNode::Send { recv: Some(recv), method, args, block, .. }
             if method.as_str() == "<<" && args.len() == 1 =>
         {
-            let is_string_builder_append = matches!(e.hint, Some(IrHint::StringBuilderAppend));
+            let is_string_builder_append = matches!(e.hint(), Some(IrHint::StringBuilderAppend));
             if !is_string_builder_append {
                 if let ExprNode::Var { name, .. } = &*recv.node {
                     *out.entry(name.clone()).or_insert(0) += 1;
@@ -873,7 +873,7 @@ pub(super) fn collect_reassigned(body: &Expr) -> HashSet<Symbol> {
 ///   site is the function's tail; an Append at the tail would be
 ///   a lowerer bug).
 fn try_string_builder_stmt(e: &Expr, declared: &mut HashSet<Symbol>) -> Option<Vec<JsStmt>> {
-    match e.hint.as_ref()? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) | IrHint::InvalidErrorType | IrHint::ErrorMessagesEach | IrHint::ErrorsPortOriginal(_) | IrHint::SingularBuilder { .. } => None, // CRuby/JRuby-only hints, the plain node elsewhere
@@ -1310,7 +1310,7 @@ pub(super) fn js_expr(e: &Expr) -> Js {
     }
     // Analyzer-set diagnostic annotations short-circuit to a target
     // raise-equivalent (preserves Ruby's runtime-raise semantics).
-    if let Some(kind) = &e.diagnostic {
+    if let Some(kind) = &e.diagnostic() {
         return Js::new(
             e.span,
             JsExpr::Raw(
@@ -1325,7 +1325,7 @@ pub(super) fn js_expr(e: &Expr) -> Js {
     // Append-inside-lambda (`articles.forEach(a => io << render(a))`
     // — the partial lowerer's collection-render shape) and the
     // terminal Result Var read at the function tail.
-    match e.hint {
+    match e.hint() {
         Some(IrHint::StringBuilderAppend) => {
             if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node {
                 if method.as_str() == "<<" && args.len() == 1 {

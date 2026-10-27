@@ -158,9 +158,29 @@ fn a_file_load_hook_registers_as_written_on_the_postgresql_tree() {
     assert_eq!(String::from_utf8_lossy(&emitted.stdout), expected);
 }
 
+/// The CRuby tree of an app on another database (SQLite here) carries
+/// the lazy_load_hooks port for the registration as well: it emits, and
+/// the hook registers where the file loads and runs once fired. Before,
+/// only the PostgreSQL tree carried the port and this tree refused the
+/// whole emit, so a MySQL app whose support file registers a hook for
+/// its own adapter's class emitted nothing.
+#[test]
+fn a_file_load_hook_registers_as_written_on_the_sqlite_cruby_tree() {
+    let expected = "\"ActiveRecord::ConnectionNotEstablished\"\n\"ActiveRecord::AdapterError\"\nfalse\ntrue\ntrue\n\
+                    \"ActiveRecord::ConnectionTimedout\"\n";
+    // Loaded as a file of the tree that requires it would load it.
+    let script = format!(
+        "require RoundhouseAutoload.path(\"models/roundhouse_files/lib/patches/active_record/granular_exceptions\")\n{HOOK_SCRIPT}"
+    );
+    let run = emit_and_run::real_blog().write("lib/patches/active_record/granular_exceptions.rb", GRANULAR).run_ruby(&script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    let boot = std::fs::read_to_string(run.emitted.join("boot.rb")).expect("boot.rb");
+    assert!(boot.contains("require_relative \"runtime/active_support_lazy_load_hooks\""), "{boot}");
+}
+
 #[test]
 fn a_tree_without_the_lazy_load_hooks_port_refuses_the_registration() {
-    // No database configuration: the SQLite tree.
     let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [(
         std::path::PathBuf::from("lib/patches/active_record/granular_exceptions.rb"),
         GRANULAR.as_bytes().to_vec(),
@@ -172,18 +192,42 @@ fn a_tree_without_the_lazy_load_hooks_port_refuses_the_registration() {
         app.file_programs.iter().any(|p| p.source.ends_with("granular_exceptions.rb")),
         "the file program is carried"
     );
-    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
-        let (result, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
-            roundhouse::project::target_files(&app, std::path::Path::new("not-a-fixture"), target)
-        });
-        let error = result.err().unwrap_or_else(|| panic!("{} emitted the registration", target.as_str()));
-        assert!(error.contains("`ActiveSupport.on_load` registration needs the PostgreSQL CRuby tree"), "{error}");
-        assert!(
-            diagnostics.iter().any(|d| d.message.contains("load_hook_registration")
-                && d.message.contains("`ActiveSupport.on_load(:active_record_trilogyadapter)`")),
-            "{diagnostics:#?}"
-        );
+    let (result, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, std::path::Path::new("not-a-fixture"), BuildTarget::Spinel)
+    });
+    let error = result.err().expect("spinel emitted the registration");
+    assert!(error.contains("`ActiveSupport.on_load` registration needs the CRuby tree"), "{error}");
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("load_hook_registration")
+            && d.message.contains("`ActiveSupport.on_load(:active_record_trilogyadapter)`")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// A survey reports the registration a tree cannot run as a gap and
+/// goes on with the emit, as it does for the other unsupported
+/// constructs, instead of ending the whole emit on it.
+#[test]
+fn a_survey_reports_the_registration_and_goes_on() {
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [(
+        std::path::PathBuf::from("lib/patches/active_record/granular_exceptions.rb"),
+        GRANULAR.as_bytes().to_vec(),
+    )]
+    .into_iter()
+    .collect();
+    roundhouse::ingest::survey::activate();
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let (result, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, std::path::Path::new("not-a-fixture"), BuildTarget::Spinel)
+    });
+    if let Err(error) = &result {
+        assert!(!error.contains("`ActiveSupport.on_load` registration"), "{error}");
     }
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("load_hook_registration")
+            && d.message.contains("`ActiveSupport.on_load(:active_record_trilogyadapter)`")),
+        "{diagnostics:#?}"
+    );
 }
 
 /// The file program loads each `ActiveRecord::X = Class.new(...)` class

@@ -142,11 +142,11 @@ fn site_stub(span: Span) -> Expr {
 /// A nil carrying the report — the ruby emitter renders it as the raise.
 fn stub_expr(span: crate::span::Span) -> Expr {
     let mut e = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
-    e.diagnostic = Some(DiagnosticKind::Unsupported {
+    e.set_diagnostic(Some(DiagnosticKind::Unsupported {
         target: None,
         construct: Symbol::from(CONSTRUCT),
         detail: DETAIL.to_string(),
-    });
+    }));
     e
 }
 
@@ -331,10 +331,10 @@ pub fn apply_cruby_module_protocol(app: &mut App) {
     fn lift(expr: &mut Expr) {
         expr.node.for_each_child_mut(&mut lift);
         if matches!(&*expr.node, ExprNode::Send { .. })
-            && matches!(&expr.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. })
+            && matches!(&expr.diagnostic(), Some(DiagnosticKind::Unsupported { construct, .. })
                 if construct.as_str() == MODULE_PROTOCOL)
         {
-            expr.diagnostic = None;
+            expr.set_diagnostic(None);
         }
     }
     super::for_each_forwarding_body(app, &mut lift);

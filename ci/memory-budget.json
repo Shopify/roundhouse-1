@@ -1,0 +1,7 @@
+{
+  "comment": "Peak memory of a memory-census dev build compiling scripts/synth-app at two sizes (scripts/memory-budget). Lower these when a change lowers memory; raise them only with a reason in the PR.",
+  "small": { "packs": 50, "live_peak_mb": 333, "rss_anon_peak_mb": 348 },
+  "large": { "packs": 200, "live_peak_mb": 1321, "rss_anon_peak_mb": 1339 },
+  "growth_per_pack_mb": { "live_peak_mb": 6.59, "rss_anon_peak_mb": 6.61 },
+  "tolerance": { "live_peak_mb": 0.05, "rss_anon_peak_mb": 0.1 }
+}
