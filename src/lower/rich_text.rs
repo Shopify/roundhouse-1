@@ -351,13 +351,13 @@ fn push_record_methods(methods: &mut Vec<MethodDef>, model: &Model) {
                 name: Symbol::from(SYNC_EMBEDS),
                 receiver: MethodReceiver::Instance,
                 params: Vec::new(),
-                body: seq(vec![
+                body: (seq(vec![
                     Expr::new(
                         Span::synthetic(),
                         ExprNode::If { cond: blank, then_branch: nil_lit(), else_branch: sync },
                     ),
                     nil_lit(),
-                ]),
+                ])).into(),
                 signature: Some(fn_sig(vec![], Ty::Nil)),
                 effects: crate::effect::EffectSet::default(),
                 enclosing_class: Some(model.name.0.clone()),
@@ -381,7 +381,7 @@ fn push_record_methods(methods: &mut Vec<MethodDef>, model: &Model) {
             name: body_col.clone(),
             receiver: MethodReceiver::Instance,
             params: Vec::new(),
-            body: content_new(ivar("body")),
+            body: content_new(ivar("body")).into(),
             signature: Some(fn_sig(vec![], content_ty.clone())),
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -412,13 +412,13 @@ fn push_record_methods(methods: &mut Vec<MethodDef>, model: &Model) {
             name: Symbol::from("body="),
             receiver: MethodReceiver::Instance,
             params: vec![Param::positional(value.clone())],
-            body: Expr::new(
+            body: (Expr::new(
                 Span::synthetic(),
                 ExprNode::Assign {
                     target: LValue::Ivar { name: body_col },
                     value: no_arg_send(var_ref(value.clone()), "to_s"),
                 },
-            ),
+            )).into(),
             signature: Some(fn_sig(vec![(value, Ty::Str)], Ty::Str)),
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -451,7 +451,7 @@ fn push_record_methods(methods: &mut Vec<MethodDef>, model: &Model) {
             name: Symbol::from("body_before_type_cast"),
             receiver: MethodReceiver::Instance,
             params: Vec::new(),
-            body: no_arg_send(ivar("body"), "to_s"),
+            body: no_arg_send(ivar("body"), "to_s").into(),
             signature: Some(fn_sig(vec![], Ty::Str)),
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1072,7 +1072,7 @@ pub(crate) fn push_preload_scope_methods(methods: &mut Vec<MethodDef>, model: &M
                 rel.clone(),
                 super::model_to_library::relation_new_self(),
             )],
-            body: Expr::new(
+            body: (Expr::new(
                 Span::synthetic(),
                 ExprNode::Send {
                     recv: Some(var_ref(rel.clone())),
@@ -1081,7 +1081,7 @@ pub(crate) fn push_preload_scope_methods(methods: &mut Vec<MethodDef>, model: &M
                     block: None,
                     parenthesized: true,
                 },
-            ),
+            )).into(),
             // No signature, matching `push_scope_methods` — a declared
             // `scope` leaves this None too. A `Ty::Relation` in the
             // signature is a relation REACHING EMIT, which every

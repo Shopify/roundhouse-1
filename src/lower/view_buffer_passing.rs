@@ -256,7 +256,7 @@ fn split(m: &MethodDef, module_path: &[Symbol], acc: &str) -> (MethodDef, Method
     variant.signature = into_signature;
     let mut vbody = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: into_body });
     vbody.inherit_span(m.body.span);
-    variant.body = vbody;
+    variant.body = vbody.into();
 
     // The wrapper: capacity-hinted alloc, the `_into` call, memo store,
     // then the trailing read. Keeps the StringBuilder hints on alloc /
@@ -284,7 +284,7 @@ fn split(m: &MethodDef, module_path: &[Symbol], acc: &str) -> (MethodDef, Method
         },
     );
     wbody.inherit_span(m.body.span);
-    wrapper.body = wbody;
+    wrapper.body = wbody.into();
 
     (variant, wrapper)
 }

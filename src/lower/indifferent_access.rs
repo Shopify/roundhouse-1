@@ -60,12 +60,12 @@ fn coerce_declared_params(app: &mut App) {
                     assign
                 })
                 .collect();
-            let mut body = std::mem::replace(&mut method.body, Expr::new(span, ExprNode::Seq { exprs: vec![] }));
+            let mut body = std::mem::replace(&mut method.body, (Expr::new(span, ExprNode::Seq { exprs: vec![] })).into());
             if let ExprNode::Seq { exprs } = &mut *body.node {
                 stmts.append(exprs);
             } else {
-                stmts.push(body);
-                body = Expr::new(span, ExprNode::Seq { exprs: vec![] });
+                stmts.push(body.into_expr());
+                body = (Expr::new(span, ExprNode::Seq { exprs: vec![] })).into();
             }
             *body.node = ExprNode::Seq { exprs: stmts };
             method.body = body;

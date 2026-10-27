@@ -160,7 +160,7 @@ fn delegate(target: &MethodDef, twin: Symbol) -> MethodDef {
     MethodDef {
         name: twin,
         name_span: Span::synthetic(),
-        body,
+        body: body.into(),
         kind: AccessorKind::Method,
         ..target.clone()
     }
@@ -248,7 +248,7 @@ fn synth_attribute_aliases(owner: &ClassId, model: &Model, table: &Table) -> Met
         name: Symbol::from("attribute_aliases"),
         receiver: MethodReceiver::Class,
         params: Vec::new(),
-        body: with_ty(Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false }), ty.clone()),
+        body: (with_ty(Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false }), ty.clone())).into(),
         signature: Some(fn_sig(vec![], ty)),
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),

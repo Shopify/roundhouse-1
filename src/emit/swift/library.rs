@@ -73,7 +73,7 @@ pub fn emit_function_module(
             receiver: MethodReceiver::Class,
             params: f.params.clone(),
             block_param: None,
-            body: f.body.clone(),
+            body: f.body.clone().into(),
             signature: f.signature.clone(),
             effects: f.effects.clone(),
             enclosing_class: Some(crate::ident::Symbol::from(enclosing.clone())),

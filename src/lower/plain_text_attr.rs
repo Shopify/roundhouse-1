@@ -550,7 +550,7 @@ pub(crate) fn push_preload_scope_methods(methods: &mut Vec<MethodDef>, model: &M
                 rel.clone(),
                 super::model_to_library::relation_new_self(),
             )],
-            body: Expr::new(
+            body: (Expr::new(
                 Span::synthetic(),
                 ExprNode::Send {
                     recv: Some(var_ref(rel.clone())),
@@ -562,7 +562,7 @@ pub(crate) fn push_preload_scope_methods(methods: &mut Vec<MethodDef>, model: &M
                     block: None,
                     parenthesized: true,
                 },
-            ),
+            )).into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),

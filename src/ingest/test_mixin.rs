@@ -1916,7 +1916,7 @@ impl ClassWalk<'_> {
     /// else the class body's own.
     fn def_teardown(&self, tm: &TestModule) -> Option<Expr> {
         match self.block_helpers.iter().find(|m| m.name.as_str() == "teardown" && m.receiver == MethodReceiver::Instance) {
-            Some(m) => Some(m.body.clone()),
+            Some(m) => Some((*m.body).clone()),
             None => class_def_teardown(tm),
         }
     }
@@ -2517,14 +2517,14 @@ fn merge_teardowns(
                     _ => return Err("its merged `teardown` is not the shape the shared-test splice expects".into()),
                 }
             } else {
-                merged.body
+                merged.body.into_expr()
             });
         }
     }
     if def_part.is_none() {
         if let Some(m) = block_helpers.iter().position(is_teardown).map(|i| block_helpers.remove(i)) {
             name_span = m.name_span;
-            def_part = Some(m.body);
+            def_part = Some(m.body.into_expr());
         }
     }
     let def_part = def_part.unwrap_or_else(|| Expr::new(Span::synthetic(), ExprNode::Super { args: None, block: None }));
@@ -2701,7 +2701,7 @@ fn class_def_teardown(tm: &TestModule) -> Option<Expr> {
     }
     let m = tm.helpers.iter().find(|m| m.name.as_str() == "teardown")?;
     if !tm.teardown_blocks {
-        return Some(m.body.clone());
+        return Some((*m.body).clone());
     }
     match &*m.body.node {
         ExprNode::Seq { exprs } => exprs.first().cloned(),
@@ -3270,7 +3270,7 @@ fn closure_callback(frame: &MethodDef) -> crate::dialect::TestBodyStatement {
             rest_param: None,
             extra_params: Vec::new(),
             block_param: None,
-            body: frame.body.clone(),
+            body: (*frame.body).clone(),
             block_style: crate::expr::BlockStyle::Do,
             signature: crate::expr::BlockSignature::default(),
         },
@@ -4431,7 +4431,7 @@ fn synth_method(name: &str, body: Expr, class: &ClassId) -> MethodDef {
         params: Vec::new(),
         unsupported_formals: None,
         has_anonymous_block: false,
-        body,
+        body: body.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(class.0.clone()),

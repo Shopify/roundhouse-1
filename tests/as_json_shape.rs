@@ -29,7 +29,7 @@ fn as_json_body(app: &roundhouse::App, model_name: &str) -> roundhouse::expr::Ex
     for item in &model.body {
         if let roundhouse::dialect::ModelBodyItem::Method { method, .. } = item {
             if method.name.as_str() == "as_json" {
-                return method.body.clone();
+                return (*method.body).clone();
             }
         }
     }
@@ -259,7 +259,7 @@ fn as_json_method(
     for item in &model.body {
         if let roundhouse::dialect::ModelBodyItem::Method { method, .. } = item {
             if method.name.as_str() == "as_json" {
-                return (method.params.clone(), method.body.clone());
+                return (method.params.clone(), (*method.body).clone());
             }
         }
     }

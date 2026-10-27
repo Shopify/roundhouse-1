@@ -98,22 +98,22 @@ pub fn apply_defined_ivar_memo_lowering(app: &mut App) {
 fn for_each_root(app: &mut App, f: &mut impl FnMut(&mut Expr, bool)) {
     let mut bodies: BTreeSet<*const Expr> = BTreeSet::new();
     for model in &app.models {
-        for item in &model.body {
+        for item in &*model.body {
             match item {
-                ModelBodyItem::Method { method, .. } => bodies.insert(&method.body),
+                ModelBodyItem::Method { method, .. } => bodies.insert(&*method.body),
                 ModelBodyItem::Scope { scope, .. } => bodies.insert(&scope.body),
                 _ => false,
             };
         }
     }
     for lc in app.library_classes.iter().chain(app.rails_application.iter()) {
-        bodies.extend(lc.methods.iter().map(|m| &m.body as *const Expr));
+        bodies.extend(lc.methods.iter().map(|m| &*m.body as *const Expr));
     }
     for controller in &app.controllers {
         for item in &controller.body {
             match item {
                 ControllerBodyItem::Action { action, .. } => bodies.insert(&action.body),
-                ControllerBodyItem::ClassMethod { method, .. } => bodies.insert(&method.body),
+                ControllerBodyItem::ClassMethod { method, .. } => bodies.insert(&*method.body),
                 _ => false,
             };
         }

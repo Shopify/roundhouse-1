@@ -27,7 +27,7 @@ use crate::span::Span;
 
 /// Rewrite local in-place accumulation in a method body into rebinds.
 pub fn transform_method(mut m: MethodDef) -> MethodDef {
-    m.body = rewrite(&m.body);
+    m.body = rewrite(&m.body).into();
     m
 }
 
@@ -267,7 +267,7 @@ mod tests {
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(s("flag"))],
             block_param: None,
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,
@@ -326,7 +326,7 @@ mod tests {
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(s("v"))],
             block_param: None,
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,
@@ -388,7 +388,7 @@ mod tests {
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(s("article"))],
             block_param: None,
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,
@@ -447,7 +447,7 @@ mod tests {
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(s("v"))],
             block_param: None,
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,
@@ -510,7 +510,7 @@ mod tests {
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(s("coll")), Param::positional(s("k"))],
             block_param: None,
-            body: syn(ExprNode::Seq { exprs: vec![each, var(&s("acc"))] }),
+            body: (syn(ExprNode::Seq { exprs: vec![each, var(&s("acc"))] })).into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,
@@ -565,7 +565,7 @@ mod tests {
             receiver: MethodReceiver::Class,
             params: vec![Param::positional(s("k")), Param::positional(s("v"))],
             block_param: None,
-            body: syn(ExprNode::Seq { exprs: vec![index_set, var(&s("acc"))] }),
+            body: (syn(ExprNode::Seq { exprs: vec![index_set, var(&s("acc"))] })).into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,

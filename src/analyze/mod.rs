@@ -3739,7 +3739,7 @@ impl Analyzer {
                         // write of its own (`authorize`) still needs its
                         // typed body as a resolution target for
                         // `collect_transitive_filter_ivars`.
-                        action_bodies.entry(method.name.clone()).or_insert_with(|| body.clone());
+                        action_bodies.entry(method.name.clone()).or_insert_with(|| (*body).clone());
                     }
                 }
             } else if let Some((cached_bindings, cached_bodies)) =
@@ -6860,7 +6860,7 @@ impl Analyzer {
             }
             for body in module.helpers.iter().flat_map(|method| {
                 method.params.iter().filter_map(|param| param.default.as_ref())
-                    .chain(std::iter::once(&method.body))
+                    .chain(std::iter::once(&*method.body))
             })
                 .chain(module.tests.iter().map(|test| &test.body)) {
                 self.collect_send_sites(body, Some(&module.name), MethodReceiver::Instance, helpers, &mut test_sites);

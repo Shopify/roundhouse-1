@@ -379,7 +379,7 @@ fn build_library_class(
     // attributes to the template as a whole — same convention as the
     // ERB lowerer.
     body.inherit_span(view.body.span);
-    method.body = body;
+    method.body = body.into();
 
     if type_body {
         type_method_body_solo(&mut method);
@@ -567,7 +567,7 @@ fn jbuilder_method_parts(
         name: method_name,
         receiver: MethodReceiver::Class,
         params,
-        body: seq(Vec::new()),
+        body: seq(Vec::new()).into(),
         signature,
         effects: EffectSet::default(),
         enclosing_class: Some(module_id.0.clone()),

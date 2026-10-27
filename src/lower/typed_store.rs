@@ -455,7 +455,7 @@ fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Sy
     else {
         return;
     };
-    reader.body = accessor(col);
+    reader.body = accessor(col).into();
     reader.signature = Some(super::model_to_library::fn_sig(vec![], Ty::Untyped));
     // `<col>_was` and `<col>_in_database`: the Hash the column held
     // before the pending change, over the raw serialized value.
@@ -466,7 +466,7 @@ fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Sy
         }) else {
             continue;
         };
-        was.body = sp_expr(ExprNode::Send {
+        was.body = (sp_expr(ExprNode::Send {
             recv: Some(sp_expr(ExprNode::Const { path: vec![Symbol::from("TypedStore")] })),
             method: Symbol::from("snapshot"),
             args: vec![
@@ -482,7 +482,7 @@ fn push_store_hash_methods(methods: &mut Vec<MethodDef>, model: &Model, col: &Sy
             ],
             block: None,
             parenthesized: true,
-        });
+        })).into();
         was.signature = Some(super::model_to_library::fn_sig(vec![], Ty::Untyped));
     }
     let key = Symbol::from("key");

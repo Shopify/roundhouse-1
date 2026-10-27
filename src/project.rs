@@ -14002,7 +14002,7 @@ fn report_strict_validation_contexts(app: &App, target: BuildTarget) {
     for method in sti_validates {
         let stmts = match &*method.body.node {
             crate::expr::ExprNode::Seq { exprs } => exprs.as_slice(),
-            _ => std::slice::from_ref(&method.body),
+            _ => std::slice::from_ref(&*method.body),
         };
         spans.extend(stmts.iter().filter(|s| !s.span.is_synthetic() && names_context(s)).map(|s| s.span));
     }
@@ -20324,7 +20324,7 @@ mod tests {
                 _ => {
                     let mut changed = method.clone();
                     if root == 4 || root == 6 {
-                        changed.body = constant;
+                        changed.body = constant.into();
                     } else {
                         changed.params = vec![Param::with_default(Symbol::new("value"), constant)];
                     }

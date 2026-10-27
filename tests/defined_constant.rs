@@ -13,13 +13,13 @@ fn method_body(source: &str) -> roundhouse::Expr {
     let mut app = App::new();
     app.library_classes = classes;
     Analyzer::new(&app).analyze(&mut app);
-    app.library_classes
+    (app.library_classes
         .iter()
         .find(|class| class.name.0.as_str() == "Probe")
         .expect("Probe")
         .methods[0]
         .body
-        .clone()
+        .clone()).into_expr()
 }
 
 fn defined_operand(body: &roundhouse::Expr) -> &roundhouse::Expr {

@@ -104,7 +104,7 @@ fn getter(ivar: &Symbol, name: &Symbol) -> MethodDef {
         receiver: MethodReceiver::Instance,
         params: vec![],
         block_param: None,
-        body: Expr::new(span, ExprNode::Seq { exprs: vec![assign_c, make, var("c")] }),
+        body: (Expr::new(span, ExprNode::Seq { exprs: vec![assign_c, make, var("c")] })).into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: None,

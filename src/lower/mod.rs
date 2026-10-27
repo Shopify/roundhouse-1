@@ -1708,7 +1708,7 @@ pub fn module_funcs_to_library_class(
             name: f.name.clone(),
             receiver: MethodReceiver::Class,
             params: f.params.clone(),
-            body: f.body.clone(),
+            body: f.body.clone().into(),
             signature: f.signature.clone(),
             effects: f.effects.clone(),
             enclosing_class: Some(crate::ident::Symbol::from(name)),

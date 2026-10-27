@@ -72,13 +72,13 @@ pub(super) fn carry_sig_autoloads(classes: &mut [LibraryClass], sources: &[Sourc
                     Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: Symbol::from("_") }, value })
                 })
                 .collect();
-            let body = std::mem::replace(&mut method.body, Expr::new(span, ExprNode::Seq { exprs: Vec::new() }));
+            let body = std::mem::replace(&mut *method.body, (Expr::new(span, ExprNode::Seq { exprs: Vec::new() })).into());
             let body_span = body.span;
             match *body.node {
                 ExprNode::Seq { exprs: rest } => exprs.extend(rest),
                 node => exprs.push(Expr::new(body_span, node)),
             }
-            method.body = Expr::new(body_span, ExprNode::Seq { exprs });
+            method.body = (Expr::new(body_span, ExprNode::Seq { exprs })).into();
         }
     }
 }

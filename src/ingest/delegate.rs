@@ -1258,7 +1258,7 @@ mod tests {
             params: Vec::new(),
             block_param: None,
             name_span: Span::synthetic(),
-            body: Expr::new(
+            body: (Expr::new(
                 Span::synthetic(),
                 ExprNode::Send {
                     recv: None,
@@ -1270,7 +1270,7 @@ mod tests {
                     block: None,
                     parenthesized: false,
                 },
-            ),
+            )).into(),
             signature: None,
             effects: EffectSet::default(),
             enclosing_class: None,

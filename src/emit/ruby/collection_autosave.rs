@@ -336,7 +336,7 @@ pub(crate) fn apply(
                 stmts.insert(at, call(&format!("_validate_associated_records_for_{}", c.name.as_str()), None));
             }
             stmts.push(call("_ensure_no_duplicate_errors", None));
-            *body = Expr::new(body.span, ExprNode::Seq { exprs: stmts });
+            *body = (Expr::new(body.span, ExprNode::Seq { exprs: stmts })).into();
         }
         // Rails' `after_create save_method` / `after_update save_method`,
         // by name, in declaration order, ahead of the callbacks the
@@ -354,7 +354,7 @@ pub(crate) fn apply(
             for (i, name) in order.iter().enumerate() {
                 stmts.insert(i, call(&entry_point(name), None));
             }
-            *body = Expr::new(body.span, ExprNode::Seq { exprs: stmts });
+            *body = (Expr::new(body.span, ExprNode::Seq { exprs: stmts })).into();
         }
         // An `autosave: true` has_one saves in the create and update chains
         // above, as Rails' does, not in `after_save`, where the lowering
@@ -375,9 +375,9 @@ pub(crate) fn apply(
                 let mut stmts = statements(&m.body);
                 stmts.retain(|e| !bare(e));
                 m.body = if stmts.is_empty() {
-                    Expr::new(m.body.span, ExprNode::Lit { value: Literal::Nil })
+                    (Expr::new(m.body.span, ExprNode::Lit { value: Literal::Nil })).into()
                 } else {
-                    Expr::new(m.body.span, ExprNode::Seq { exprs: stmts })
+                    (Expr::new(m.body.span, ExprNode::Seq { exprs: stmts })).into()
                 };
             }
         }
@@ -640,7 +640,7 @@ fn around_save_collection_association(lc: &mut LibraryClass) {
         .and_then(|mut ms| ms.pop())
         .map(|m| m.body)
         .expect("generated save wrapper parses");
-    let mut body = Some(m.body.clone());
+    let mut body = Some((*m.body).clone());
     replace_bare_call(&mut wrapper, PLACEHOLDER, &mut body);
     if body.is_none() {
         wrapper.span = m.body.span;
@@ -845,7 +845,7 @@ fn accept_held_required_targets(
         *stmt = Expr::new(
             check.span,
             ExprNode::If {
-                cond: not_held,
+                cond: not_held.into_expr(),
                 then_branch: check,
                 else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
             },

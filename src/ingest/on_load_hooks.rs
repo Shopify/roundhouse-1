@@ -131,7 +131,7 @@ pub(super) fn lift<V: Vfs + ?Sized>(
             let Some(mut method) = synth.pop() else { continue };
             if !kept.is_empty() {
                 let span = kept[0].span;
-                method.body = Expr::new(span, ExprNode::Seq { exprs: kept });
+                method.body = (Expr::new(span, ExprNode::Seq { exprs: kept })).into();
             }
             // The `on_load` call itself is not consumed: the survey
             // descends into its block, where each kept statement is.

@@ -153,7 +153,7 @@ fn body(source: &str) -> roundhouse::Expr {
     let mut app = App::new();
     app.library_classes = classes;
     Analyzer::new(&app).analyze(&mut app);
-    app.library_classes[0].methods[0].body.clone()
+    (*app.library_classes[0].methods[0].body).clone()
 }
 
 #[test]

@@ -125,11 +125,11 @@ pub(super) fn chain_inherited_lifecycle_hooks(lcs: &mut [LibraryClass], app: &Ap
             let sup = Expr::new(Span::synthetic(), ExprNode::Super { args: Some(Vec::new()), block: None });
             let own = match &*m.body.node {
                 ExprNode::Seq { exprs } => exprs.clone(),
-                _ => vec![m.body.clone()],
+                _ => vec![(*m.body).clone()],
             };
             let mut stmts = vec![sup];
             stmts.extend(own);
-            m.body = Expr::new(m.body.span, ExprNode::Seq { exprs: stmts });
+            m.body = (Expr::new(m.body.span, ExprNode::Seq { exprs: stmts })).into();
         }
     }
 }
@@ -3288,10 +3288,11 @@ fn loaded_answers_stale(lc: &mut LibraryClass, name: &Symbol) {
         .unwrap_or_else(|e| panic!("loaded_answers_stale: generated source failed to parse: {e}\n{src}"))
         .pop()
         .expect("one method")
-        .body;
+        .body
+        .into_expr();
     let last = match &mut *m.body.node {
         ExprNode::Seq { exprs } => exprs.last_mut(),
-        _ => Some(&mut m.body),
+        _ => Some(&mut *m.body),
     };
     if let Some(last) = last.filter(|e| matches!(&*e.node, ExprNode::Ivar { name } if name == &loaded)) {
         let ty = last.ty.clone();
@@ -3319,8 +3320,8 @@ fn ensure_cache_guard(lc: &mut LibraryClass, name: &Symbol) {
     if guarded {
         return;
     }
-    let old = std::mem::replace(&mut m.body, Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }));
-    m.body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![preload_cache_guard(name), old] });
+    let old = std::mem::replace(&mut m.body, (Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] })).into());
+    m.body = (Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![preload_cache_guard(name), old.into_expr()] })).into();
 }
 
 /// Ruby-family pre-emit pass: `record.reload` drops every association
@@ -3389,7 +3390,7 @@ end
         let span = reload.body.span;
         let mut stmts = match &*reload.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
-            _ => vec![reload.body.clone()],
+            _ => vec![(*reload.body).clone()],
         };
         // Before the method's value (its last statement).
         let value = stmts.pop();
@@ -3407,7 +3408,7 @@ end
             ));
         }
         stmts.extend(value);
-        reload.body = Expr::new(span, ExprNode::Seq { exprs: stmts });
+        reload.body = (Expr::new(span, ExprNode::Seq { exprs: stmts })).into();
         reload.mutates_self = true;
     }
 }
@@ -3443,13 +3444,13 @@ fn load_on_assign(lc: &mut LibraryClass, name: &Symbol, stale_state: bool) {
     let span = m.body.span;
     let mut stmts = match &*m.body.node {
         ExprNode::Seq { exprs } => exprs.clone(),
-        _ => vec![m.body.clone()],
+        _ => vec![(*m.body).clone()],
     };
     match &*assign.body.node {
         ExprNode::Seq { exprs } => stmts.extend(exprs.iter().cloned()),
-        _ => stmts.push(assign.body.clone()),
+        _ => stmts.push((*assign.body).clone()),
     }
-    m.body = Expr::new(span, ExprNode::Seq { exprs: stmts });
+    m.body = (Expr::new(span, ExprNode::Seq { exprs: stmts })).into();
 }
 
 /// Ruby-family pre-emit pass: a has_many or has_one reader that runs its
@@ -3599,8 +3600,8 @@ fn track_through_reader(lc: &mut LibraryClass, name: &Symbol) {
             exprs.push(wrap(value));
         }
         _ => {
-            let body = std::mem::replace(&mut m.body, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
-            m.body = wrap(body);
+            let body = std::mem::replace(&mut m.body, (Expr::new(span, ExprNode::Lit { value: Literal::Nil })).into());
+            m.body = wrap(body.into_expr()).into();
         }
     }
 }
@@ -3685,6 +3686,7 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
                         .pop()
                         .expect("one method")
                         .body
+                        .into_expr()
                 })
             })
             .flatten(),
@@ -3746,7 +3748,7 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
     let target_name = Symbol::from(format!("{}_target", name.as_str()));
     if let Some(m) = lc.methods.iter_mut().find(|m| m.name == target_name && m.receiver == MethodReceiver::Instance) {
         let sp = m.body.span;
-        m.body = Expr::new(
+        m.body = (Expr::new(
             sp,
             ExprNode::Send {
                 recv: Some(Expr::new(
@@ -3764,7 +3766,7 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool, pl
                 block: None,
                 parenthesized: true,
             },
-        );
+        )).into();
     }
 }
 
@@ -3782,7 +3784,7 @@ fn push_association_scope(lc: &mut LibraryClass, name: &Symbol, rel: Expr) {
             .clone();
         scope_method.name = scope_name;
         scope_method.signature = None;
-        scope_method.body = rel;
+        scope_method.body = rel.into();
         lc.methods.push(scope_method);
     }
 }
@@ -5136,10 +5138,10 @@ fn invalidate_on_fk_write(lc: &mut LibraryClass, name: &Symbol, fk: &Symbol, sta
         .expect("one method");
     let mut stmts = match &*m.body.node {
         ExprNode::Seq { exprs } => exprs.clone(),
-        _ => vec![m.body.clone()],
+        _ => vec![(*m.body).clone()],
     };
-    stmts.insert(0, guard.body);
-    m.body = Expr::new(span, ExprNode::Seq { exprs: stmts });
+    stmts.insert(0, guard.body.into_expr());
+    m.body = (Expr::new(span, ExprNode::Seq { exprs: stmts })).into();
 }
 
 /// Ruby-family pre-emit pass: an STI row hydrates as its SUBCLASS.
@@ -5848,7 +5850,7 @@ fn autosave_method(
         receiver: MethodReceiver::Instance,
         visibility: MethodVisibility::Public,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -5883,10 +5885,10 @@ fn fold_before_validation(
     {
         let mut stmts = match &*existing.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
-            _ => vec![existing.body.clone()],
+            _ => vec![(*existing.body).clone()],
         };
         stmts.insert(0, call);
-        existing.body = Expr::new(span, ExprNode::Seq { exprs: stmts });
+        existing.body = (Expr::new(span, ExprNode::Seq { exprs: stmts })).into();
         return;
     }
     methods.push(crate::dialect::MethodDef {
@@ -5897,7 +5899,7 @@ fn fold_before_validation(
         receiver: MethodReceiver::Instance,
         visibility: MethodVisibility::Public,
         params: Vec::new(),
-        body: call,
+        body: call.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -5977,7 +5979,7 @@ pub(crate) fn apply_through_assoc_lowering(lcs: &mut [LibraryClass], app: &App) 
                 &edge.owner_bind(),
                 &hop_scopes,
                 &assoc_scope,
-            );
+            ).into();
         }
         // `has_one :x, through: :y`: the same join answering the one row
         // (activerecord has_one_through_association.rb), under the
@@ -7156,7 +7158,7 @@ fn push_helper_ivar_writers(
             receiver: MethodReceiver::Instance,
             visibility: MethodVisibility::Public,
             params: vec![crate::dialect::Param::positional(Symbol::from("value"))],
-            body: Expr::new(
+            body: (Expr::new(
                 span,
                 ExprNode::Assign {
                     target: LValue::Ivar { name: name.clone() },
@@ -7165,7 +7167,7 @@ fn push_helper_ivar_writers(
                         ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from("value") },
                     ),
                 },
-            ),
+            )).into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(class_name.0.clone()),
@@ -7195,7 +7197,7 @@ fn push_helper_ivar_readers(
             receiver: MethodReceiver::Instance,
             visibility: MethodVisibility::Public,
             params: vec![],
-            body: Expr::new(Span::synthetic(), ExprNode::Ivar { name: name.clone() }),
+            body: (Expr::new(Span::synthetic(), ExprNode::Ivar { name: name.clone() })).into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(class_name.0.clone()),
@@ -8870,7 +8872,7 @@ pub(crate) fn apply_fixture_memoization(lcs: &mut [LibraryClass]) {
                 continue;
             }
             if is_fixture_lookup(&m.body) {
-                m.body = memoized_fixture_body(&m.name, &m.body);
+                m.body = memoized_fixture_body(&m.name, &m.body).into();
             } else if m.name.as_str() == "_fixtures_load!" {
                 let mut exprs: Vec<Expr> = labels
                     .iter()
@@ -8887,8 +8889,8 @@ pub(crate) fn apply_fixture_memoization(lcs: &mut [LibraryClass]) {
                         )
                     })
                     .collect();
-                exprs.push(m.body.clone());
-                m.body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs });
+                exprs.push((*m.body).clone());
+                m.body = (Expr::new(Span::synthetic(), ExprNode::Seq { exprs })).into();
             }
         }
     }
@@ -9115,7 +9117,7 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
                 lc.methods
                     .iter()
                     .filter(|m| m.receiver == MethodReceiver::Instance)
-                    .map(|m| (m.name.as_str(), &m.body))
+                    .map(|m| (m.name.as_str(), &*m.body))
             });
             for (name, body) in slice_methods.chain(controller_methods.iter().copied()) {
                 if ambiguous.contains(name) {
@@ -9879,7 +9881,7 @@ pub(crate) fn apply_datetime_lowering(lcs: &mut [LibraryClass], app: &App) {
                 {
                     let column = table.columns.iter().find(|c| c.name == m.name).unwrap();
                     let (_, parser, _) = crate::lower::model_to_library::schema::temporal_seam(column);
-                    m.body = temporal_reader_body(&m.name, parser);
+                    m.body = temporal_reader_body(&m.name, parser).into();
                 }
                 // Hand-written temporal writers only, same reasoning:
                 // synthesized models write storage via `<col>_raw=`
@@ -9896,7 +9898,7 @@ pub(crate) fn apply_datetime_lowering(lcs: &mut [LibraryClass], app: &App) {
                             // Date uses the shared date-only formatter.
                             // Keep the pre-existing legacy timestamp
                             // iso8601 policy, not a Time storage refactor.
-                            m.body = temporal_writer_body(&col, &param.name, (ty == Ty::Date).then_some(formatter));
+                            m.body = temporal_writer_body(&col, &param.name, (ty == Ty::Date).then_some(formatter)).into();
                         }
                     }
                     // The synthesized `<col>_raw=` writer's own store
@@ -9919,11 +9921,11 @@ pub(crate) fn apply_datetime_lowering(lcs: &mut [LibraryClass], app: &App) {
                         ExprNode::OpAssign {
                             target: LValue::Ivar { name: parse_memo_ivar(&m.name) },
                             op: crate::expr::OpAssignOp::OrOr,
-                            value: m.body.clone(),
+                            value: (*m.body).clone(),
                         },
                     );
                     // Not the memo as read: Rails converts an attribute into `Time.zone` on every read, and `use_zone` may have moved it.
-                    m.body = Expr::new(
+                    m.body = (Expr::new(
                         Span::synthetic(),
                         ExprNode::Send {
                             recv: Some(Expr::new(
@@ -9935,7 +9937,7 @@ pub(crate) fn apply_datetime_lowering(lcs: &mut [LibraryClass], app: &App) {
                             block: None,
                             parenthesized: true,
                         },
-                    );
+                    )).into();
                 }
                 _ => {}
             }
@@ -10166,14 +10168,14 @@ pub(crate) fn apply_rich_text_content_memo(lcs: &mut [LibraryClass]) {
                 continue;
             }
             if m.params.is_empty() && memoized.contains(&m.name) && content_new_of_ivar(&m.body).is_some() {
-                m.body = Expr::new(
+                m.body = (Expr::new(
                     m.body.span,
                     ExprNode::OpAssign {
                         target: LValue::Ivar { name: content_memo_ivar(&m.name) },
                         op: crate::expr::OpAssignOp::OrOr,
-                        value: m.body.clone(),
+                        value: (*m.body).clone(),
                     },
-                );
+                )).into();
                 continue;
             }
             reset_content_memo_on_writes(&mut m.body, &memoized);
@@ -10352,11 +10354,11 @@ pub(crate) fn apply_hydration_nil_lowering(lcs: &mut [LibraryClass], app: &App) 
                                     method: Symbol::from("nil?"), args: vec![], block: None,
                                     parenthesized: false,
                                 });
-                                m.body = Expr::new(m.body.span, ExprNode::If {
+                                m.body = (Expr::new(m.body.span, ExprNode::If {
                                     cond,
                                     then_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
-                                    else_branch: m.body.clone(),
-                                });
+                                    else_branch: (*m.body).clone(),
+                                })).into();
                             }
                         }
                     }
@@ -11468,7 +11470,7 @@ fn synthesize_module_lc(
             receiver: MethodReceiver::Class,
             visibility: MethodVisibility::Public,
             params: f.params.clone(),
-            body: f.body.clone(),
+            body: f.body.clone().into(),
             signature: f.signature.clone(),
             effects: f.effects.clone(),
             enclosing_class: Some(module_id.0.clone()),
@@ -21920,7 +21922,7 @@ pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
             if is_plain_ivar_read(&m.body, &col) {
                 let cast = boolean_cast_body(&col);
                 m.body = if *nullable && !m.name.as_str().ends_with('?') {
-                    sp_expr(ExprNode::If {
+                    (sp_expr(ExprNode::If {
                         cond: sp_expr(ExprNode::Send {
                             recv: Some(ivar_read(&col)),
                             method: Symbol::from("nil?"),
@@ -21930,9 +21932,9 @@ pub(crate) fn apply_boolean_lowering(lcs: &mut [LibraryClass], app: &App) {
                         }),
                         then_branch: sp_expr(ExprNode::Lit { value: Literal::Nil }),
                         else_branch: cast,
-                    })
+                    })).into()
                 } else {
-                    cast
+                    cast.into()
                 };
             }
         }
@@ -22039,12 +22041,12 @@ pub(crate) fn apply_preload_lowering(lcs: &mut [LibraryClass], app: &App, subcla
             };
             let old = std::mem::replace(
                 &mut m.body,
-                Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+                (Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] })).into(),
             );
-            m.body = Expr::new(
+            m.body = (Expr::new(
                 Span::synthetic(),
-                ExprNode::Seq { exprs: vec![preload_cache_guard(name), old] },
-            );
+                ExprNode::Seq { exprs: vec![preload_cache_guard(name), old.into_expr()] },
+            )).into();
         }
 
         let src = preload_methods_source(model, app, view);
@@ -23128,7 +23130,7 @@ mod insert_rel_param_tests {
             name: Symbol::from("those_tagged"),
             receiver: MethodReceiver::Class,
             params,
-            body: Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            body: (Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Nil })).into(),
             signature,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(Symbol::from("Widget")),

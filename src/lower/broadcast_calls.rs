@@ -42,14 +42,14 @@ pub(crate) fn apply_broadcast_calls_lowering(app: &mut App) {
         let Some(owner) = owners.iter().find(|m| m.name == model.name) else { continue };
         for item in &mut model.body {
             let ModelBodyItem::Method { method, .. } = item else { continue };
-            method.body = rewrite_rails_broadcast_calls(method.body.clone(), owner);
+            method.body = rewrite_rails_broadcast_calls((*method.body).clone(), owner).into();
         }
     }
 
     for lc in &mut app.library_classes {
         let Some(owner) = enclosing_model(&lc.name, &owners) else { continue };
         for method in &mut lc.methods {
-            method.body = rewrite_rails_broadcast_calls(method.body.clone(), owner);
+            method.body = rewrite_rails_broadcast_calls((*method.body).clone(), owner).into();
         }
     }
 

@@ -217,7 +217,7 @@ fn dynamic_superclasses(app: &App) -> crate::det::HashSet<String> {
     }
     for lc in &app.library_classes {
         let scope = lc.name.0.as_str();
-        let exprs = lc.methods.iter().map(|m| &m.body).chain(lc.constants.iter().map(|(_, v)| v));
+        let exprs = lc.methods.iter().map(|m| &*m.body).chain(lc.constants.iter().map(|(_, v)| v));
         for e in exprs.chain(&lc.unknown_calls).chain(&lc.class_ivar_initializers) {
             scan(e, scope, &classes, &mut out);
         }

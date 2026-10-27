@@ -567,7 +567,7 @@ fn synth_method(
             has_anonymous_block: false,
             block_param: None,
             name_span: Span::synthetic(),
-            body,
+            body: body.into(),
             signature,
             effects: EffectSet::pure(),
             enclosing_class: None,

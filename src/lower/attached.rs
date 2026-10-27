@@ -1013,7 +1013,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
         name: attr.clone(),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature: Some(super::model_to_library::fn_sig(vec![], attached_ty.clone())),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -1036,7 +1036,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
         name: preload_setter_name(attr),
         receiver: MethodReceiver::Instance,
         params: vec![crate::dialect::Param::positional(att.clone())],
-        body: syn(ExprNode::Seq {
+        body: (syn(ExprNode::Seq {
             exprs: vec![
                 syn(ExprNode::Assign {
                     target: crate::expr::LValue::Ivar { name: cache.clone() },
@@ -1044,7 +1044,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
                 }),
                 syn(ExprNode::Lit { value: Literal::Nil }),
             ],
-        }),
+        })).into(),
         signature: Some(super::model_to_library::fn_sig(vec![(att, attached_ty)], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -1067,7 +1067,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
         name: attachment_loaded_name(attr),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: syn(ExprNode::Send {
+        body: (syn(ExprNode::Send {
             recv: Some(syn(ExprNode::Send {
                 recv: Some(syn(ExprNode::Ivar { name: cache })),
                 method: Symbol::from("nil?"),
@@ -1079,7 +1079,7 @@ fn push_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) {
             args: vec![],
             block: None,
             parenthesized: false,
-        }),
+        })).into(),
         signature: Some(super::model_to_library::fn_sig(vec![], Ty::Bool)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -1339,7 +1339,7 @@ fn push_many_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) 
         name: attr.clone(),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature: Some(super::model_to_library::fn_sig(vec![], many_ty.clone())),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -1359,7 +1359,7 @@ fn push_many_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) 
         name: many_preload_setter_name(attr),
         receiver: MethodReceiver::Instance,
         params: vec![crate::dialect::Param::positional(att.clone())],
-        body: syn(ExprNode::Seq {
+        body: (syn(ExprNode::Seq {
             exprs: vec![
                 syn(ExprNode::Assign {
                     target: crate::expr::LValue::Ivar { name: cache },
@@ -1367,7 +1367,7 @@ fn push_many_reader(methods: &mut Vec<MethodDef>, model: &Model, attr: &Symbol) 
                 }),
                 syn(ExprNode::Lit { value: Literal::Nil }),
             ],
-        }),
+        })).into(),
         signature: Some(super::model_to_library::fn_sig(vec![(att, many_ty)], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -1455,7 +1455,7 @@ pub(crate) fn push_preload_scope_methods(methods: &mut Vec<MethodDef>, model: &M
                 rel.clone(),
                 super::model_to_library::relation_new_self(),
             )],
-            body: Expr::new(
+            body: (Expr::new(
                 Span::synthetic(),
                 ExprNode::Send {
                     recv: Some(Expr::new(
@@ -1470,7 +1470,7 @@ pub(crate) fn push_preload_scope_methods(methods: &mut Vec<MethodDef>, model: &M
                     block: None,
                     parenthesized: true,
                 },
-            ),
+            )).into(),
             // No signature — see the note on the rich-text twin: a
             // `Ty::Relation` in a signature is a relation REACHING EMIT,
             // which every emitter reports as unsupported. The analyzer's

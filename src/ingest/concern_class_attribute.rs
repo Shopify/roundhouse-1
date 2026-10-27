@@ -361,7 +361,7 @@ fn reader(name: &Symbol, parent: Option<&ClassId>, owner: &str) -> MethodDef {
         name,
         MethodReceiver::Class,
     );
-    method.body = body;
+    method.body = body.into();
     method.kind = crate::dialect::AccessorKind::Method;
     method
 }

@@ -1237,7 +1237,7 @@ fn render_body(ctx: &EmitCtx, m: &MethodDef) -> String {
     let body = if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
         backprop_return_ty_to_tail(&m.body, ret)
     } else {
-        m.body.clone()
+        (*m.body).clone()
     };
     emit_return_body(ctx, &body)
 }

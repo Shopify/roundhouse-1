@@ -309,7 +309,7 @@ fn rewrite_to_fs(expr: &mut Expr, formats: &TimeFormats, zone_port: bool) {
                 // Integer-returning `:epoch` agree with the Str the
                 // analyzer types this call as.
                 *expr.node = ExprNode::Send {
-                    recv: Some(body),
+                    recv: Some(body.into_expr()),
                     method: Symbol::from("to_s"),
                     args: vec![],
                     block: None,

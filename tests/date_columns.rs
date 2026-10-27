@@ -488,7 +488,7 @@ fn date_gate_checks_modeled_strict_local_defaults() {
     let ModelBodyItem::Method { method, .. } = &source.models[0].body[0] else {
         panic!("not a method")
     };
-    app.views[0].strict_locals.as_mut().unwrap()[0].default = Some(method.body.clone());
+    app.views[0].strict_locals.as_mut().unwrap()[0].default = Some((*method.body).clone());
     assert_rejected(&app);
 }
 

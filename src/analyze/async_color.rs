@@ -737,7 +737,7 @@ mod tests {
             name: Symbol::from(name),
             receiver: MethodReceiver::Instance,
             params: Vec::new(),
-            body: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            body: (Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })).into(),
             signature: None,
             effects: EffectSet::default(),
             enclosing_class: None,
@@ -870,7 +870,7 @@ mod tests {
 
     fn synth_method_with_body(name: &str, body: Expr) -> MethodDef {
         let mut m = synth_method(name);
-        m.body = body;
+        m.body = body.into();
         m
     }
 
@@ -1059,7 +1059,7 @@ mod tests {
         // async getter.
         let mut reader = synth_method("title");
         reader.kind = AccessorKind::AttributeReader;
-        reader.body = synth_send("seed", None, vec![]);
+        reader.body = synth_send("seed", None, vec![]).into();
         let mut classes = vec![
             synth_class(
                 "A",
@@ -1081,7 +1081,7 @@ mod tests {
     fn sync_slot_violation_on_attribute_writer() {
         let mut writer = synth_method("title=");
         writer.kind = AccessorKind::AttributeWriter;
-        writer.body = synth_send("seed", None, vec![]);
+        writer.body = synth_send("seed", None, vec![]).into();
         let mut classes = vec![
             synth_class(
                 "A",

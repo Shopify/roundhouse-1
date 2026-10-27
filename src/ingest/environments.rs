@@ -542,7 +542,7 @@ pub(super) fn collect_programs<V: Vfs + ?Sized>(
             if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!("def self.{RUN_METHOD}\n  nil\nend\n")) {
                 if let Some(mut method) = synth.pop() {
                     let span = kept[0].span;
-                    method.body = Expr::new(span, ExprNode::Seq { exprs: kept });
+                    method.body = (Expr::new(span, ExprNode::Seq { exprs: kept })).into();
                     app.library_classes.push(programs::holder_class(&holder, method));
                     program_out.holder = Some(ClassId(Symbol::from(holder.as_str())));
                 }

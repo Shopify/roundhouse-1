@@ -1099,7 +1099,7 @@ mod tests {
             name: Symbol::from(name),
             receiver: MethodReceiver::Instance,
             params: params.iter().map(|p| Param::positional(Symbol::from(*p))).collect(),
-            body,
+            body: body.into(),
             signature: Some(signature),
             effects: EffectSet::default(),
             enclosing_class: None,

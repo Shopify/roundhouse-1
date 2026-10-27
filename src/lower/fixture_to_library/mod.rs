@@ -144,7 +144,7 @@ fn fixtures_reached_by_variable(app: &App) -> crate::det::HashSet<Symbol> {
             .tests
             .iter()
             .map(|t| &t.body)
-            .chain(tm.helpers.iter().map(|h| &h.body))
+            .chain(tm.helpers.iter().map(|h| &*h.body))
             .chain(tm.setup.iter());
         for body in bodies {
             collect_variable_fixture_calls(body, &names, &mut out);
@@ -199,7 +199,7 @@ fn build_fixture_class(
                 name: r.label.clone(),
                 receiver: MethodReceiver::Class,
                 params: Vec::new(),
-                body,
+                body: body.into(),
                 signature: Some(fn_sig(vec![], class_ty.clone())),
                 effects: EffectSet::default(),
                 enclosing_class: Some(owner_id.0.clone()),
@@ -241,7 +241,7 @@ fn build_fixture_class(
             from_keyword: false,
             from_kwrest: false,
         }],
-        body: build_by_label_body(&f.class, &f.records),
+        body: build_by_label_body(&f.class, &f.records).into(),
         signature: Some(fn_sig(
             vec![(Symbol::from("label"), Ty::Untyped)],
             class_ty.clone(),
@@ -268,7 +268,7 @@ fn build_fixture_class(
         name: Symbol::from("_fixtures_load!"),
         receiver: MethodReceiver::Class,
         params: Vec::new(),
-        body: load_body,
+        body: load_body.into(),
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner_id.0.clone()),
@@ -931,7 +931,7 @@ fn class_method(owner: &ClassId, name: Symbol, params: Vec<crate::dialect::Param
         name,
         receiver: MethodReceiver::Class,
         params,
-        body,
+        body: body.into(),
         signature: Some(signature),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),

@@ -1382,16 +1382,17 @@ fn reclassify_abstract_attributes(methods: &mut [MethodDef]) {
             );
             let body = std::mem::replace(
                 &mut init.body,
-                Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Nil }),
-            );
+                (Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Nil })).into(),
+            )
+            .into_expr();
             init.body = match *body.node {
                 ExprNode::Seq { exprs } => {
                     let mut all = Vec::with_capacity(exprs.len() + 1);
                     all.push(assign);
                     all.extend(exprs);
-                    Expr::new(Span::synthetic(), ExprNode::Seq { exprs: all })
+                    (Expr::new(Span::synthetic(), ExprNode::Seq { exprs: all })).into()
                 }
-                _ => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign, body] }),
+                _ => (Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign, body] })).into(),
             };
         }
     }
@@ -1429,7 +1430,7 @@ fn synthesize_reader(attr: &str, enclosing: Option<&str>) -> MethodDef {
         name,
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::pure(),
         enclosing_class: enclosing.map(Symbol::new),
@@ -1469,7 +1470,7 @@ fn synthesize_writer(attr: &str, enclosing: Option<&str>) -> MethodDef {
         name: setter_name,
         receiver: MethodReceiver::Instance,
         params: vec![Param::positional(value_param)],
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::pure(),
         enclosing_class: enclosing.map(Symbol::new),
@@ -1525,7 +1526,7 @@ fn method_def_from(
         name,
         receiver,
         params,
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::pure(),
         enclosing_class: enclosing.map(Symbol::new),
@@ -1751,7 +1752,7 @@ mod tests {
         let src = "def pluralize(count, word)\n  count == 1 ? \"1 #{word}\" : \"#{count} #{word}s\"\nend\n";
         let m = parse_one(src);
 
-        let (cond, then_branch, else_branch) = match *m.body.node {
+        let (cond, then_branch, else_branch) = match *m.body.into_expr().node {
             ExprNode::If {
                 cond,
                 then_branch,
@@ -1871,7 +1872,7 @@ mod tests {
     fn multi_statement_body_is_sequenced() {
         let src = "def f\n  1\n  2\nend\n";
         let m = parse_one(src);
-        let exprs = match *m.body.node {
+        let exprs = match *m.body.into_expr().node {
             ExprNode::Seq { exprs } => exprs,
             other => panic!("expected Seq for multi-stmt body, got {other:?}"),
         };

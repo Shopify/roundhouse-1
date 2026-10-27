@@ -79,10 +79,10 @@ fn module_singleton_shape() {
         name: Symbol::from("adapter"),
         receiver: MethodReceiver::Class,
         params: vec![],
-        body: Expr::new(
+        body: (Expr::new(
             Span::synthetic(),
             ExprNode::Ivar { name: Symbol::from("adapter") },
-        ),
+        )).into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -105,7 +105,7 @@ fn module_singleton_shape() {
         name: Symbol::from("adapter="),
         receiver: MethodReceiver::Class,
         params: vec![DialectParam::positional(Symbol::from("value"))],
-        body: Expr::new(
+        body: (Expr::new(
             Span::synthetic(),
             ExprNode::Assign {
                 target: LValue::Ivar { name: Symbol::from("adapter") },
@@ -117,7 +117,7 @@ fn module_singleton_shape() {
                     },
                 ),
             },
-        ),
+        )).into(),
         signature: Some(Ty::Fn {
             params: vec![TyParam {
                 name: Symbol::from("value"),
@@ -252,10 +252,10 @@ fn module_singleton_does_not_fire_on_plain_class() {
         name: Symbol::from("adapter"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: Expr::new(
+        body: (Expr::new(
             Span::synthetic(),
             ExprNode::Ivar { name: Symbol::from("adapter") },
-        ),
+        )).into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -344,7 +344,7 @@ fn raise_panic_peephole() {
         name: Symbol::from("fail!"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("msg"))],
-        body: raise_2arg,
+        body: raise_2arg.into(),
         signature: Some(Ty::Fn {
             params: vec![TyParam {
                 name: Symbol::from("msg"),
@@ -385,7 +385,7 @@ fn raise_panic_peephole() {
         name: Symbol::from("abort_with"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("msg"))],
-        body: raise_1arg,
+        body: raise_1arg.into(),
         signature: Some(Ty::Fn {
             params: vec![TyParam {
                 name: Symbol::from("msg"),
@@ -501,7 +501,7 @@ fn time_now_utc_iso8601_peephole() {
         name: Symbol::from("stamp"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: chain,
+        body: chain.into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -589,7 +589,7 @@ fn include_array_recv_routes_to_slices_contains() {
         name: Symbol::from("has_col?"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("cols"))],
-        body,
+        body: body.into(),
         signature: Some(Ty::Fn {
             params: vec![TyParam {
                 name: Symbol::from("cols"),
@@ -675,7 +675,7 @@ fn negative_index_rewrites_to_len_minus_n() {
         name: Symbol::from("tail"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("records"))],
-        body: neg_one,
+        body: neg_one.into(),
         signature: Some(Ty::Fn {
             params: vec![TyParam {
                 name: Symbol::from("records"),
@@ -779,7 +779,7 @@ fn class_reflection_rewrites() {
         name: Symbol::from("lookup_cols"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: class_chain,
+        body: class_chain.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Reflect")),
@@ -817,7 +817,7 @@ fn class_reflection_rewrites() {
         name: Symbol::from("lookup_name"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: class_name_chain,
+        body: class_name_chain.into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -854,7 +854,7 @@ fn class_reflection_rewrites() {
         name: Symbol::from("diag"),
         receiver: MethodReceiver::Class,
         params: vec![],
-        body: bare_name,
+        body: bare_name.into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -936,7 +936,7 @@ fn bare_new_in_class_method_resolves_to_constructor() {
         name: Symbol::from("create"),
         receiver: MethodReceiver::Class,
         params: vec![DialectParam::positional(Symbol::from("attrs"))],
-        body: Expr::new(
+        body: (Expr::new(
             Span::synthetic(),
             ExprNode::Send {
                 recv: None,
@@ -948,7 +948,7 @@ fn bare_new_in_class_method_resolves_to_constructor() {
                 block: None,
                 parenthesized: true,
             },
-        ),
+        )).into(),
         signature: Some(Ty::Fn {
             params: vec![TyParam {
                 name: Symbol::from("attrs"),
@@ -1022,10 +1022,10 @@ fn implicit_self_method_call_resolution() {
         name: Symbol::from("status"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: Expr::new(
+        body: (Expr::new(
             Span::synthetic(),
             ExprNode::Ivar { name: Symbol::from("status") },
-        ),
+        )).into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -1049,7 +1049,7 @@ fn implicit_self_method_call_resolution() {
         name: Symbol::from("notify"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: Expr::new(Span::synthetic(), ExprNode::Lit { value: roundhouse::Literal::Nil }),
+        body: (Expr::new(Span::synthetic(), ExprNode::Lit { value: roundhouse::Literal::Nil })).into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -1105,10 +1105,10 @@ fn implicit_self_method_call_resolution() {
         name: Symbol::from("tick"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: Expr::new(
+        body: (Expr::new(
             Span::synthetic(),
             ExprNode::Seq { exprs: vec![s_assign, notify_call, s_return] },
-        ),
+        )).into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -1215,7 +1215,7 @@ fn each_array_block_shape() {
         name: Symbol::from("traverse"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(arr_param)],
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Loop")),
@@ -1307,7 +1307,7 @@ fn each_hash_block_shape() {
         name: Symbol::from("traverse"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(h_param)],
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("HashLoop")),
@@ -1396,7 +1396,7 @@ fn map_array_block_shape() {
         name: Symbol::from("doubled"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(arr_param)],
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("Mapper")),
@@ -1480,7 +1480,7 @@ fn empty_body_with_nonvoid_return_synthesizes_zero_value() {
         name: Symbol::from(name),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body,
+        body: body.into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -1597,7 +1597,7 @@ fn typed_empty_literals_back_propagate() {
         name: Symbol::from("errors"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: typed_array_lit(Ty::Str),
+        body: typed_array_lit(Ty::Str).into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -1621,7 +1621,7 @@ fn typed_empty_literals_back_propagate() {
         name: Symbol::from("lookup"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: typed_hash_lit(Ty::Str, Ty::Str),
+        body: typed_hash_lit(Ty::Str, Ty::Str).into(),
         signature: Some(Ty::Fn {
             params: vec![].into(),
             block: None,
@@ -1922,7 +1922,7 @@ fn nil_check_to_comma_ok_rewrites_pair() {
         name: Symbol::from("f"),
         receiver: MethodReceiver::Instance,
         params: vec![DialectParam::positional(Symbol::from("other"))],
-        body: body_seq,
+        body: body_seq.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("StubFlash")),
@@ -2021,7 +2021,7 @@ fn nil_check_to_comma_ok_skips_non_hash_receiver() {
         name: Symbol::from("f"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: body_seq,
+        body: body_seq.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(Symbol::from("StubFlash")),

@@ -457,7 +457,7 @@ pub(super) fn synthesize_process_action(
         name: Symbol::from("process_action"),
         receiver: MethodReceiver::Instance,
         params: vec![Param::positional(param_sym.clone())],
-        body,
+        body: body.into(),
         // process_action dispatches to the named action and returns
         // whatever it returns; concretely each action body terminates
         // in render/redirect (returns Nil), so dispatch returns Nil.

@@ -55,7 +55,7 @@ fn analyzed_call(name: &str) -> roundhouse::expr::Expr {
     if let roundhouse::expr::ExprNode::Seq { exprs } = &*body.node {
         exprs.last().unwrap().clone()
     } else {
-        body.clone()
+        ((*body).clone()).into_expr()
     }
 }
 
@@ -97,7 +97,7 @@ fn no_block_returns_integer_array_and_block_returns_string() {
         );
     }
     let mut pending = vec![
-        &class
+        &*class
             .methods
             .iter()
             .find(|m| m.name.as_str() == "yielded")
@@ -336,7 +336,7 @@ fn nil_bytes_exemption_preserves_other_forwarding_boundaries() {
         let mut pending: Vec<_> = app
             .models
             .iter()
-            .flat_map(|model| model.methods().map(|method| &method.body))
+            .flat_map(|model| model.methods().map(|method| &*method.body))
             .collect();
         let mut materializing_call = false;
         while let Some(expression) = pending.pop() {
@@ -389,7 +389,7 @@ fn shared_bridge_evaluates_receiver_once_and_rejects_arguments() {
         .clone();
     // Method bodies may contain their single expression in a Seq.
     if let ExprNode::Seq { exprs } = &*expression.node {
-        expression = exprs.last().unwrap().clone();
+        expression = exprs.last().unwrap().clone().into();
     }
     for target in [
         Target::Rust,
@@ -421,7 +421,7 @@ fn shared_bridge_evaluates_receiver_once_and_rejects_arguments() {
     }
     let argument = expression.clone();
     if let ExprNode::Send { args, .. } = &mut *expression.node {
-        args.push(argument);
+        args.push(argument.into_expr());
     }
     let (_, diagnostics) = emit::diagnostics::scope(|| {
         string_bytes::emit(&expression, Target::Python, |_| {

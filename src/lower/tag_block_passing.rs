@@ -110,7 +110,7 @@ fn tag_block_shape(m: &MethodDef) -> Option<(Vec<InterpPart>, usize)> {
     if m.params.iter().any(|p| p.keyword || p.rest || p.default.is_some()) {
         return None;
     }
-    let mut body = &m.body;
+    let mut body: &Expr = &m.body;
     if let ExprNode::Seq { exprs } = &*body.node {
         if exprs.len() != 1 {
             return None;
@@ -261,7 +261,7 @@ fn half_variant(m: &MethodDef, half: &str, parts: Vec<InterpPart>) -> MethodDef 
     v.signature = signature;
     let mut vbody = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: body });
     vbody.inherit_span(m.body.span);
-    v.body = vbody;
+    v.body = vbody.into();
     v
 }
 

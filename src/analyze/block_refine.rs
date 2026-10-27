@@ -204,7 +204,7 @@ mod tests {
             name: Symbol::from("each"),
             receiver: MethodReceiver::Instance,
             params: vec![],
-            body: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+            body: (Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] })).into(),
             signature: Some(Ty::Fn {
                 params: vec![Param {
                     name: Symbol::new("block"),
@@ -248,7 +248,7 @@ mod tests {
             name: Symbol::from("forwarder"),
             receiver: MethodReceiver::Instance,
             params: vec![],
-            body: send_each,
+            body: send_each.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: Some(Symbol::from("Holder")),

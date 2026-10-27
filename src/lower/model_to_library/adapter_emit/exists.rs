@@ -44,7 +44,7 @@ fn synth_exists_probe(
         name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params,
-        body: dialect.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner).into(),
         signature: Some(fn_sig(param_tys, Ty::Bool)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),

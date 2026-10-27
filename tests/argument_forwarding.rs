@@ -292,7 +292,7 @@ fn forwarding_markers_are_not_values_or_gradual_escapes() {
         (PathBuf::from("app/models/article.rb"), format!("class Article < ApplicationRecord; {methods}; end").into_bytes()),
     ])).unwrap();
     Analyzer::new(&app).analyze(&mut app);
-    let mut pending: Vec<_> = app.models[0].methods().map(|m| &m.body).collect();
+    let mut pending: Vec<_> = app.models[0].methods().map(|m| &*m.body).collect();
     let mut packets = Vec::new();
     let mut yields = Vec::new();
     while let Some(expr) = pending.pop() {

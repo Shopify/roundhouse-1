@@ -273,7 +273,7 @@ fn lower_call(owner: &ClassId, call: &Call, span: Span) -> Option<(MethodDef, Ex
     let merge = methods.find(|m| m.receiver == MethodReceiver::Class)?.body;
     method.enclosing_class = Some(owner.0.clone());
     method.name_span = span;
-    Some((method, merge))
+    Some((method, merge.into_expr()))
 }
 
 /// What the `extended` hook adds: the class attribute's methods (the

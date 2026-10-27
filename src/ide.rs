@@ -1272,7 +1272,7 @@ fn scope_groups(app: &App) -> Vec<Vec<&Expr>> {
     // answer inside them too (the guide's `Product::Notifications` and
     // `ProductMailer` were blank).
     for lc in &app.library_classes {
-        let group: Vec<&Expr> = lc.methods.iter().map(|m| &m.body).collect();
+        let group: Vec<&Expr> = lc.methods.iter().map(|m| &*m.body).collect();
         if !group.is_empty() {
             groups.push(group);
         }
@@ -1459,14 +1459,14 @@ fn bodies_of_class_family<'a>(app: &'a App, owner: &ClassId) -> Vec<&'a Expr> {
         }
         if let Some(m) = app.models.iter().find(|m| &m.name == id) {
             out.extend(m.scopes().map(|s| &s.body));
-            out.extend(m.methods().map(|me| &me.body));
+            out.extend(m.methods().map(|me| &*me.body));
             out.extend(m.body.iter().filter_map(|i| match i {
                 ModelBodyItem::Unknown { expr, .. } => Some(expr),
                 _ => None,
             }));
         }
         if let Some(lc) = app.library_classes.iter().find(|lc| &lc.name == id) {
-            out.extend(lc.methods.iter().map(|me| &me.body));
+            out.extend(lc.methods.iter().map(|me| &*me.body));
         }
     }
     out
@@ -1481,12 +1481,12 @@ fn owner_of_body(app: &App, body: &Expr) -> Option<ClassId> {
         }
     }
     for m in &app.models {
-        if m.methods().any(|me| std::ptr::eq(&me.body, body)) || m.scopes().any(|s| std::ptr::eq(&s.body, body)) {
+        if m.methods().any(|me| std::ptr::eq(&*me.body, body)) || m.scopes().any(|s| std::ptr::eq(&s.body, body)) {
             return Some(m.name.clone());
         }
     }
     for lc in &app.library_classes {
-        if lc.methods.iter().any(|me| std::ptr::eq(&me.body, body)) {
+        if lc.methods.iter().any(|me| std::ptr::eq(&*me.body, body)) {
             return Some(lc.name.clone());
         }
     }

@@ -336,7 +336,7 @@ impl Run<'_> {
         let mut bound = self.bind(def, args, env)?;
         let statements: Vec<Expr> = match &*def.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
-            _ => vec![def.body.clone()],
+            _ => vec![(*def.body).clone()],
         };
         for st in &statements {
             if self.exec(st, &mut bound, depth)? {
@@ -511,7 +511,7 @@ impl Run<'_> {
             has_anonymous_block: false,
             block_param: None,
             name_span: block.span,
-            body,
+            body: body.into(),
             signature: None,
             effects: Default::default(),
             enclosing_class: Some(self.owner.clone()),

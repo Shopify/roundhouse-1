@@ -447,7 +447,7 @@ fn article_lowers_dependent_destroy_to_before_destroy() {
     let exprs = match body {
         roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
         // Single statement collapses to non-Seq; treat as one-element list.
-        _ => vec![cb.body.clone()],
+        _ => vec![(*cb.body).clone()],
     };
     assert!(!exprs.is_empty(), "before_destroy should not be empty");
     // First (and only) statement: `comments.each { |c| c.destroy }`.
@@ -612,7 +612,7 @@ end
 fn body_stmts(m: &roundhouse::dialect::MethodDef) -> Vec<roundhouse::Expr> {
     match &*m.body.node {
         roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
-        _ => vec![m.body.clone()],
+        _ => vec![(*m.body).clone()],
     }
 }
 
@@ -1875,12 +1875,12 @@ fn a_models_own_to_param_wins_over_the_synthesized_one() {
         name: Symbol::from("to_param"),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: roundhouse::expr::Expr::new(
+        body: (roundhouse::expr::Expr::new(
             roundhouse::span::Span::synthetic(),
             roundhouse::expr::ExprNode::Lit {
                 value: roundhouse::expr::Literal::Str { value: "custom".into() },
             },
-        ),
+        )).into(),
         signature: None,
         effects: Default::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -1940,12 +1940,12 @@ fn a_models_own_to_key_feeds_dom_record_key() {
         name: Symbol::from("to_key"),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: roundhouse::expr::Expr::new(
+        body: (roundhouse::expr::Expr::new(
             roundhouse::span::Span::synthetic(),
             roundhouse::expr::ExprNode::Lit {
                 value: roundhouse::expr::Literal::Str { value: "stub".into() },
             },
-        ),
+        )).into(),
         signature: None,
         effects: Default::default(),
         enclosing_class: Some(model.name.0.clone()),

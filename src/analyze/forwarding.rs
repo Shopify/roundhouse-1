@@ -664,7 +664,7 @@ pub(crate) fn controller_defs(app: &App) -> Vec<(ClassId, MethodDef)> {
                     has_anonymous_block: action.block_param.as_ref().is_some_and(|b| b.as_str() == "__blk"),
                     block_param: action.block_param.clone().map(crate::dialect::Param::positional),
                     name_span: action.name_span,
-                    body,
+                    body: body.into(),
                     signature: None,
                     effects: action.effects.clone(),
                     enclosing_class: Some(controller.name.0.clone()),

@@ -512,7 +512,7 @@ impl<'a> AttributionCtx<'a> {
         for m in &app.models {
             let bodies: Vec<&Expr> = m
                 .methods()
-                .map(|me| &me.body)
+                .map(|me| &*me.body)
                 .chain(m.scopes().map(|s| &s.body))
                 .collect();
             if let Some(f) = first_real_file(&bodies) {
@@ -520,7 +520,7 @@ impl<'a> AttributionCtx<'a> {
             }
         }
         for lc in &app.library_classes {
-            let bodies: Vec<&Expr> = lc.methods.iter().map(|me| &me.body).collect();
+            let bodies: Vec<&Expr> = lc.methods.iter().map(|me| &*me.body).collect();
             if let Some(f) = first_real_file(&bodies) {
                 class_file.insert(lc.name.clone(), f);
             }

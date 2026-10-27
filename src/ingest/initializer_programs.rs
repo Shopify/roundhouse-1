@@ -674,7 +674,7 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
         };
         let Some(mut method) = synth.pop() else { continue };
         let span = kept[0].span;
-        method.body = Expr::new(span, ExprNode::Seq { exprs: kept });
+        method.body = (Expr::new(span, ExprNode::Seq { exprs: kept })).into();
         app.library_classes.push(holder_class(&holder, method));
         app.initializer_programs.push(InitializerProgram {
             file: rel,
@@ -746,7 +746,7 @@ fn lifted_registration(cpath: &str, site: &str, span: crate::span::Span) -> Resu
     let method = methods.pop().ok_or("does not ingest")?;
     let mut expr = match &*method.body.node {
         ExprNode::Seq { exprs } if exprs.len() == 1 => exprs[0].clone(),
-        _ => method.body,
+        _ => method.body.into_expr(),
     };
     expr.span = span;
     Ok(expr)
@@ -846,7 +846,7 @@ pub(super) fn guard(stmt: Expr, label: &str) -> Expr {
         _ => None,
     };
     if let Some(only) = single {
-        begin = only;
+        begin = only.into();
     }
     let span = stmt.span;
     match &mut *begin.node {
@@ -854,7 +854,7 @@ pub(super) fn guard(stmt: Expr, label: &str) -> Expr {
         _ => return stmt,
     }
     begin.span = span;
-    begin
+    begin.into_expr()
 }
 
 /// Drop the refused statements of the deferred call's block and guard
