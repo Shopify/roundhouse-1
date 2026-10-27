@@ -121,8 +121,10 @@ pub fn ingest_schema_with_generated_expression_dialect(
 /// Only the migration's `change` method is replayed (`up` when no
 /// `change` exists; `down` is never touched). `change_table` blocks
 /// fold through the verbs their `t.<method>` calls stand for
-/// ([`apply_change_table`]). Schema-mutating verbs we can't fold
-/// deterministically (`execute`, raw-SQL shapes — see
+/// ([`apply_change_table`]), and `execute` folds when its SQL only
+/// changes a table's default character set or collation
+/// ([`apply_execute`]). Schema-mutating verbs we can't fold
+/// deterministically (other raw SQL, the verbs in
 /// `UNSUPPORTED_VERBS`, or a verb whose table or column name is not a
 /// literal) error with a pointer to
 /// `rails db:migrate`, which materializes the schema.rb this fallback
@@ -202,11 +204,12 @@ pub fn ingest_migration_with_generated_expression_dialect(
 
 /// Verbs that mutate schema in ways the fold doesn't model. Erroring
 /// (rather than skipping) keeps the derived schema honest — a silently
-/// missed `execute` would surface later as baffling type errors.
+/// missed `revert` would surface later as baffling type errors. Raw SQL
+/// (`execute`) gets the same treatment unless [`apply_execute`] can
+/// prove it changes nothing the fold models.
 const UNSUPPORTED_VERBS: &[&str] = &[
     "create_join_table",
     "drop_join_table",
-    "execute",
     "reversible",
     "revert",
     "up_only",
@@ -232,6 +235,7 @@ fn apply_migration_verb(
 
     let args = call_arguments(call);
     match verb {
+        "execute" => apply_execute(&args, file),
         "create_table" => {
             let mut gaps: Vec<IngestError> = Vec::new();
             let built = table_from_create_table(call, file, &mut gaps, dialect);
@@ -264,6 +268,194 @@ fn apply_migration_verb(
         "change_table" => apply_change_table(call, &args, file, schema, dialect),
         _ => apply_table_verb(verb, &args, file, schema, dialect),
     }
+}
+
+/// `execute "<SQL>"`. The fold cannot run SQL, so a statement folds
+/// only when it provably changes nothing the fold models, and anything
+/// else stays a gap naming the verb, like `UNSUPPORTED_VERBS`. What
+/// folds today are MySQL table options that set a table's default
+/// character set or collation, the usual tail of a charset migration:
+///
+/// ```sql
+/// ALTER TABLE posts COLLATE=utf8mb4_bin
+/// ALTER TABLE posts DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+/// ```
+///
+/// The fold models neither, and a table default only applies to columns
+/// added later, so no column changes. `CONVERT TO CHARACTER SET` is not
+/// one of them: it rewrites the existing string columns, and MySQL may
+/// change their types to keep their length (a long `VARCHAR` can become
+/// a `TEXT` type). The SQL must be a literal string (a heredoc with no
+/// interpolation counts), and every statement in it has to be one of
+/// these.
+fn apply_execute(args: &[Node<'_>], file: &str) -> Result<(), IngestError> {
+    let refuse = |why: String| {
+        Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "migration verb `execute` {why}, which the schema fold does not model — run \
+                 `rails db:migrate` to materialize db/schema.rb"
+            ),
+        })
+    };
+    // `execute(sql, name = nil)`: the name only labels the log line.
+    let Some(sql) = args.first().and_then(literal_text) else {
+        return refuse("is not given a literal SQL string".to_string());
+    };
+    let unmodeled = || {
+        let collapsed = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let shown: String = collapsed.chars().take(80).collect();
+        let ellipsis = if collapsed.chars().count() > 80 { "…" } else { "" };
+        refuse(format!("runs `{shown}{ellipsis}`"))
+    };
+    let Some(tokens) = sql_tokens(&sql) else {
+        return unmodeled();
+    };
+    for statement in tokens.split(|token| *token == SqlToken::Punct(';')) {
+        if !statement.is_empty() && !is_table_charset_change(statement) {
+            return unmodeled();
+        }
+    }
+    Ok(())
+}
+
+/// The text of a string literal, including a heredoc whose parts are
+/// all literal text (`<<~SQL` dedents into several string parts).
+/// `None` for anything that interpolates or is not a string.
+fn literal_text(node: &Node<'_>) -> Option<String> {
+    if let Some(string) = node.as_string_node() {
+        return std::str::from_utf8(string.unescaped()).ok().map(str::to_string);
+    }
+    let mut text = String::new();
+    for part in node.as_interpolated_string_node()?.parts().iter() {
+        text.push_str(&literal_text(&part)?);
+    }
+    Some(text)
+}
+
+/// One token of the SQL [`apply_execute`] reads.
+#[derive(Debug, PartialEq)]
+enum SqlToken {
+    /// A bare word, uppercased: a keyword or an unquoted name.
+    Word(String),
+    /// A quoted name (`` `posts` ``, `"posts"`) or string (`'utf8mb4'`).
+    Quoted(String),
+    /// `=`, `,`, `.` or `;`.
+    Punct(char),
+}
+
+/// Tokenize `sql`, dropping whitespace and comments. `None` for anything
+/// outside the small grammar the fold reads, including MySQL's
+/// executable comments (`/*! … */`) and optimizer hints (`/*+ … */`),
+/// which run their contents rather than hiding them.
+fn sql_tokens(sql: &str) -> Option<Vec<SqlToken>> {
+    let characters: Vec<char> = sql.chars().collect();
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    while let Some(&character) = characters.get(position) {
+        let next = characters.get(position + 1).copied();
+        match character {
+            _ if character.is_whitespace() => position += 1,
+            '-' if next == Some('-') => {
+                while characters.get(position).is_some_and(|&c| c != '\n') {
+                    position += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                if matches!(characters.get(position + 2), Some('!' | '+')) {
+                    return None;
+                }
+                let close = (position + 2..characters.len().saturating_sub(1))
+                    .find(|&at| characters[at] == '*' && characters[at + 1] == '/')?;
+                position = close + 2;
+            }
+            '\'' | '"' | '`' => {
+                let mut text = String::new();
+                position += 1;
+                loop {
+                    match characters.get(position) {
+                        None | Some('\\') => return None,
+                        Some(&c) if c == character => {
+                            if characters.get(position + 1) == Some(&character) {
+                                text.push(character);
+                                position += 2;
+                            } else {
+                                position += 1;
+                                break;
+                            }
+                        }
+                        Some(&c) => {
+                            text.push(c);
+                            position += 1;
+                        }
+                    }
+                }
+                tokens.push(SqlToken::Quoted(text));
+            }
+            '=' | ',' | '.' | ';' => {
+                tokens.push(SqlToken::Punct(character));
+                position += 1;
+            }
+            _ if character.is_ascii_alphanumeric() || character == '_' || character == '$' => {
+                let start = position;
+                while characters
+                    .get(position)
+                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                {
+                    position += 1;
+                }
+                let word: String = characters[start..position].iter().collect();
+                tokens.push(SqlToken::Word(word.to_ascii_uppercase()));
+            }
+            _ => return None,
+        }
+    }
+    Some(tokens)
+}
+
+/// `ALTER TABLE <name> <option>[[,] <option>]…` where every option sets
+/// the table's default character set or collation:
+/// `[DEFAULT] {CHARACTER SET | CHARSET} [=] <name>` or
+/// `[DEFAULT] COLLATE [=] <name>`.
+fn is_table_charset_change(statement: &[SqlToken]) -> bool {
+    let word = |at: usize, keyword: &str| matches!(statement.get(at), Some(SqlToken::Word(w)) if w == keyword);
+    let punct = |at: usize, mark: char| statement.get(at) == Some(&SqlToken::Punct(mark));
+    let name = |at: usize| matches!(statement.get(at), Some(SqlToken::Word(_) | SqlToken::Quoted(_)));
+    // `CHARACTER SET` or `CHARSET` at `at`: the position after it.
+    let charset = |at: usize| match () {
+        _ if word(at, "CHARACTER") && word(at + 1, "SET") => Some(at + 2),
+        _ if word(at, "CHARSET") => Some(at + 1),
+        _ => None,
+    };
+    if !(word(0, "ALTER") && word(1, "TABLE") && name(2)) {
+        return false;
+    }
+    let mut at = 3;
+    if punct(at, '.') {
+        if !name(at + 1) {
+            return false;
+        }
+        at += 2;
+    }
+    let mut options = 0;
+    while at < statement.len() {
+        if options > 0 && punct(at, ',') {
+            at += 1;
+        }
+        if word(at, "DEFAULT") {
+            at += 1;
+        }
+        let Some(after) = charset(at).or_else(|| word(at, "COLLATE").then_some(at + 1)) else {
+            return false;
+        };
+        at = if punct(after, '=') { after + 1 } else { after };
+        if !name(at) {
+            return false;
+        }
+        at += 1;
+        options += 1;
+    }
+    options > 0
 }
 
 /// A call's arguments, in order.
@@ -2766,6 +2958,80 @@ mod tests {
         assert!(message("change_table(:posts, &block)").contains("has no literal block"));
         let schema = attempt("change_table :posts do |t|\n  say \"nothing to see\"\nend").expect("no table call");
         assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "legacy", "obsolete", "views"]);
+    }
+
+    /// The tail of a charset migration: the columns change through
+    /// `change_table`, then raw SQL moves the table's own default.
+    /// Table options change nothing the fold models, in any spelling.
+    #[test]
+    fn execute_of_table_charset_and_collation_changes_folds() {
+        let schema = fold(&[
+            CREATE_POSTS,
+            r#"
+            class PostsToBinaryCollation < ActiveRecord::Migration[8.1]
+              def up
+                change_table(:posts, bulk: true) do |t|
+                  t.change(:title, :string, limit: 64, null: false, collation: "utf8mb4_bin")
+                end
+                execute("ALTER TABLE posts COLLATE=utf8mb4_bin")
+                execute "alter table `posts` default charset = utf8mb4, collate 'utf8mb4_bin';", "posts collation"
+                execute <<~SQL
+                  -- the table default, then every string column
+                  ALTER TABLE app.posts DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE = utf8mb4_bin;
+                  ALTER TABLE "posts" /* the default */ CHARSET utf8mb4;
+                SQL
+                execute <<-SQL
+                  ALTER TABLE never_created COLLATE utf8mb4_bin
+                SQL
+              end
+            end
+            "#,
+        ]);
+        assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "legacy", "obsolete", "views"]);
+        let title = col(&schema, "posts", "title");
+        assert_eq!(title.col_type, ColumnType::String { limit: Some(64) });
+        assert!(!title.nullable);
+        assert_eq!(col(&schema, "posts", "body").col_type, ColumnType::Text);
+        assert!(!schema.tables.contains_key(&Symbol::from("never_created")));
+    }
+
+    /// Any other SQL stays a gap naming the verb and the statement, so
+    /// a column added, dropped or redefined in raw SQL is never missed.
+    #[test]
+    fn execute_reports_sql_it_cannot_prove_changes_nothing() {
+        let message = |body: &str| {
+            let mut schema = fold(&[CREATE_POSTS]);
+            let source = format!("class Raw < ActiveRecord::Migration[8.1]\n  def up\n{body}\n  end\nend\n");
+            let message = ingest_migration(source.as_bytes(), "2_raw.rb", &mut schema).expect_err(body).to_string();
+            assert!(message.contains("migration verb `execute`"), "names the verb: {message}");
+            assert!(message.contains("rails db:migrate"), "points at the fix: {message}");
+            message
+        };
+        for body in [
+            r#"execute "ALTER TABLE posts ADD COLUMN slug varchar(255)""#,
+            r#"execute "ALTER TABLE posts MODIFY title varchar(64) COLLATE utf8mb4_bin""#,
+            r#"execute "ALTER TABLE posts DROP PRIMARY KEY, ADD PRIMARY KEY (title)""#,
+            r#"execute "ALTER TABLE posts COLLATE=utf8mb4_bin, DROP COLUMN legacy""#,
+            r#"execute "ALTER TABLE posts COLLATE=utf8mb4_bin; DROP TABLE posts""#,
+            r#"execute "ALTER TABLE posts /*!50100 DROP COLUMN legacy */ COLLATE=utf8mb4_bin""#,
+            r#"execute "ALTER TABLE posts COLLATE=""#,
+            r#"execute "ALTER TABLE posts COLLATE=utf8mb4_bin,""#,
+            r#"execute "ALTER TABLE posts CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin""#,
+            r#"execute "ALTER TABLE posts""#,
+            r#"execute "UPDATE posts SET views = 0""#,
+        ] {
+            assert!(message(body).contains("runs `"), "quotes the SQL: {body}");
+        }
+        assert!(message("execute \"ALTER TABLE posts ADD COLUMN slug varchar(255)\"")
+            .contains("runs `ALTER TABLE posts ADD COLUMN slug varchar(255)`"));
+        for body in [
+            r#"execute "ALTER TABLE #{table} COLLATE=utf8mb4_bin""#,
+            "execute sql",
+            "execute <<~SQL.squish\n  ALTER TABLE posts COLLATE=utf8mb4_bin\nSQL",
+            "execute",
+        ] {
+            assert!(message(body).contains("is not given a literal SQL string"), "{body}");
+        }
     }
 
     #[test]

@@ -479,7 +479,12 @@ as the verb Rails' `Table` delegates it to (`t.change` is
 removals likewise); `bulk: true` changes nothing the fold models. As
 in every Rails adapter, `change_column` keeps a column's nullability,
 default and position unless the call gives them, so a collation-only
-change leaves a `NOT NULL` column non-null. Migration shapes it can't
+change leaves a `NOT NULL` column non-null. `execute` folds when every
+statement in its literal SQL only sets the table's default character
+set or collation (`ALTER TABLE posts COLLATE=utf8mb4_bin`,
+`… DEFAULT CHARSET=utf8mb4`), which applies only to columns added later;
+any other SQL, `CONVERT TO CHARACTER SET` included (it can retype the
+string columns it re-encodes), is a gap that quotes the statement. Migration shapes it can't
 fold deterministically (see `UNSUPPORTED_VERBS`) error with a pointer
 to `rails db:migrate`, which materializes the schema.rb this fallback
 substitutes for. Roda

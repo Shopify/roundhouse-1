@@ -1,6 +1,7 @@
 //! An app with no `db/schema.rb` folds its migrations into the schema,
 //! `change_table` blocks included. A collation-only `t.change` must keep
-//! the column's `NOT NULL` and default, and the renamed, added and
+//! the column's `NOT NULL` and default, the raw-SQL table collation
+//! change that follows it must fold, and the renamed, added and
 //! defaulted columns must reach the emitted DDL and models.
 
 use super::emit_and_run;
@@ -33,6 +34,18 @@ end
       t.change_default :views, from: nil, to: 0
       t.timestamps null: true
     end
+  end
+end
+"#,
+        )
+        .write(
+            "db/migrate/20260103000000_posts_default_collation.rb",
+            r#"class PostsDefaultCollation < ActiveRecord::Migration[8.1]
+  def up
+    execute("ALTER TABLE posts COLLATE=utf8mb4_bin")
+    execute <<~SQL
+      ALTER TABLE posts DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+    SQL
   end
 end
 "#,
