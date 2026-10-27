@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Write a synthetic Rails app whose size is a parameter.
+
+`scripts/memory-budget` compares compiles of this app at two sizes: the
+absolute peak catches a regression, and the growth between the sizes
+catches memory that scales with the app. Every byte is generated
+from the arguments, so the same arguments always produce the same tree.
+
+The app is a stack of identical "packs". Each pack has two Active Record
+models, a concern, a controller with two templates, a locale file, a
+model test and a chain of plain Ruby classes. Each class in the chain
+calls the next one, so the return type of the last reaches the first one
+fixpoint round at a time, the way a deep call chain does in a large app.
+
+    scripts/synth-app OUT_DIR --packs 50 [--steps 20] [--methods 8]
+"""
+
+import argparse
+import os
+import sys
+
+
+def pack_name(index):
+    return f"Pack{index:04d}"
+
+
+def snake(index):
+    return f"pack{index:04d}"
+
+
+def write(root, relative_path, text):
+    path = os.path.join(root, relative_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def step_class(pack, step, steps, methods):
+    name = f"{pack_name(pack)}Step{step:03d}"
+    if step + 1 < steps:
+        following = f"{pack_name(pack)}Step{step + 1:03d}"
+        value = f"    {following}.new(@scale).value + @scale\n"
+    else:
+        value = "    @scale * 2\n"
+    lines = [
+        f"class {name}\n",
+        f"  include {pack_name(pack)}Trackable\n",
+        "\n",
+        "  def initialize(scale = 1)\n",
+        "    @scale = scale\n",
+        "  end\n",
+        "\n",
+        "  def value\n",
+        value,
+        "  end\n",
+        "\n",
+        "  def label(prefix)\n",
+        "    parts = [prefix, value.to_s, tracking_key]\n",
+        "    parts.map { |part| part.upcase }.join(\"-\")\n",
+        "  end\n",
+        "\n",
+        "  def summary\n",
+        "    total = 0\n",
+        "    [1, 2, 3].each do |count|\n",
+        "      total += count * @scale\n",
+        "    end\n",
+        "    { label: label(\"summary\"), total: total, tracking: tracking_label }\n",
+        "  end\n",
+        "\n",
+        "  def widgets\n",
+        f"    {pack_name(pack)}Widget.where(name: label(\"widget\")).limit(5).to_a\n",
+        "  end\n",
+    ]
+    for extra in range(max(0, methods - 4)):
+        lines += [
+            "\n",
+            f"  def measure_{extra}(amount)\n",
+            f"    if amount > {extra}\n",
+            f"      \"#{{label(\"m{extra}\")}}: #{{amount * @scale}}\"\n",
+            "    else\n",
+            "      summary[:label]\n",
+            "    end\n",
+            "  end\n",
+        ]
+    lines.append("end\n")
+    return "".join(lines)
+
+
+def write_pack(root, pack, steps, methods):
+    name = pack_name(pack)
+    prefix = snake(pack)
+    write(root, f"app/models/{prefix}_widget.rb", (
+        f"class {name}Widget < ApplicationRecord\n"
+        f"  has_many :{prefix}_parts\n"
+        "  validates :name, presence: true\n"
+        "  scope :recent, -> { order(:id).limit(10) }\n"
+        "\n"
+        "  def display_name\n"
+        "    name.strip\n"
+        "  end\n"
+        "end\n"
+    ))
+    write(root, f"app/models/{prefix}_part.rb", (
+        f"class {name}Part < ApplicationRecord\n"
+        f"  belongs_to :{prefix}_widget\n"
+        "  validates :quantity, presence: true\n"
+        "\n"
+        "  def doubled\n"
+        "    quantity * 2\n"
+        "  end\n"
+        "end\n"
+    ))
+    write(root, f"app/models/concerns/{prefix}_trackable.rb", (
+        f"module {name}Trackable\n"
+        "  extend ActiveSupport::Concern\n"
+        "\n"
+        "  def tracking_label\n"
+        "    \"#{self.class.name}:#{tracking_key}\"\n"
+        "  end\n"
+        "\n"
+        "  def tracking_key\n"
+        f"    \"{prefix}\"\n"
+        "  end\n"
+        "end\n"
+    ))
+    for step in range(steps):
+        write(root, f"app/models/{prefix}_step{step:03d}.rb", step_class(pack, step, steps, methods))
+    write(root, f"app/controllers/{prefix}_widgets_controller.rb", (
+        f"class {name}WidgetsController < ApplicationController\n"
+        "  def index\n"
+        f"    @widgets = {name}Widget.recent\n"
+        f"    @summary = {name}Step000.new(2).summary\n"
+        "  end\n"
+        "\n"
+        "  def show\n"
+        f"    @widget = {name}Widget.find(params[:id])\n"
+        "  end\n"
+        "end\n"
+    ))
+    write(root, f"app/views/{prefix}_widgets/index.html.erb", (
+        f"<h1><%= t(\"{prefix}.title\") %></h1>\n"
+        "<p><%= @summary[:label] %></p>\n"
+        "<ul>\n"
+        "<% @widgets.each do |widget| %>\n"
+        "  <li><%= widget.display_name %></li>\n"
+        "<% end %>\n"
+        "</ul>\n"
+    ))
+    write(root, f"app/views/{prefix}_widgets/show.html.erb", (
+        "<h1><%= @widget.display_name %></h1>\n"
+    ))
+    write(root, f"config/locales/{prefix}.en.yml", (
+        "en:\n"
+        f"  {prefix}:\n"
+        f"    title: \"{name} widgets\"\n"
+    ))
+    write(root, f"test/models/{prefix}_widget_test.rb", (
+        "require \"test_helper\"\n"
+        "\n"
+        f"class {name}WidgetTest < ActiveSupport::TestCase\n"
+        "  test \"display name strips the name\" do\n"
+        f"    widget = {name}Widget.new(name: \" a \")\n"
+        "    assert_equal \"a\", widget.display_name\n"
+        "  end\n"
+        "end\n"
+    ))
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("out")
+    parser.add_argument("--packs", type=int, required=True)
+    parser.add_argument("--steps", type=int, default=20, help="chained classes per pack")
+    parser.add_argument("--methods", type=int, default=8, help="methods per chained class")
+    arguments = parser.parse_args(argv)
+    if arguments.packs < 1 or arguments.steps < 1 or arguments.methods < 4:
+        parser.error("--packs and --steps must be at least 1 and --methods at least 4")
+    if os.path.exists(arguments.out) and os.listdir(arguments.out):
+        parser.error(f"{arguments.out} is not empty")
+
+    schema = ["ActiveRecord::Schema.define do\n"]
+    routes = ["Rails.application.routes.draw do\n"]
+    for pack in range(arguments.packs):
+        prefix = snake(pack)
+        schema += [
+            f"  create_table \"{prefix}_widgets\", force: :cascade do |t|\n",
+            "    t.string \"name\", null: false\n",
+            "  end\n",
+            f"  create_table \"{prefix}_parts\", force: :cascade do |t|\n",
+            "    t.integer \"quantity\", null: false\n",
+            f"    t.bigint \"{prefix}_widget_id\", null: false\n",
+            "  end\n",
+        ]
+        routes += [
+            f"  get \"/{prefix}/widgets\", to: \"{prefix}_widgets#index\", as: :{prefix}_widgets\n",
+            f"  get \"/{prefix}/widgets/:id\", to: \"{prefix}_widgets#show\", as: :{prefix}_widget\n",
+        ]
+        write_pack(arguments.out, pack, arguments.steps, arguments.methods)
+    schema.append("end\n")
+    routes.append("end\n")
+    write(arguments.out, "db/schema.rb", "".join(schema))
+    write(arguments.out, "config/routes.rb", "".join(routes))
+    write(arguments.out, "test/test_helper.rb", "require \"rails/test_help\"\n")
+    classes = arguments.packs * (arguments.steps + 3)
+    print(f"synth-app: {arguments.packs} packs, {classes} classes in {arguments.out}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

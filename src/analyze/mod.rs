@@ -11524,3 +11524,54 @@ fn expr_calls_super(body: &Expr) -> bool {
     body.node.for_each_child(&mut |c| found = found || expr_calls_super(c));
     found
 }
+
+#[cfg(feature = "memory-census")]
+impl Analyzer {
+    /// Drop the analyzer one field at a time and report what each held
+    /// (`ROUNDHOUSE_MEMORY_CENSUS=1`). Destructured without `..`, so a new
+    /// field has to be listed here; the `Copy` flags and counters own no heap.
+    pub fn census_drop(self) {
+        let Analyzer { classes, inferred_params, declared_signatures, adapter, concern_folded, host_folded, catalog_lent, extension_modules, inquirers, load_hook_bases, i18n, i18n_gem: _, helper_modules, open_classes, refined_action_bindings, const_resolver, source_indexed: _, gem_sources, extensions, typed_constants, data_factories, recursive_methods, fixpoint_rounds: _, constant_rounds: _, incremental, param_tables, site_cache, const_memo, return_cache, setup_scan, init_memo, class_factories, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_checks } = self;
+        let mut freed: Vec<(&str, i64)> = vec![
+            ("classes", crate::memory_census::freed_by(|| drop(classes))),
+            ("inferred_params", crate::memory_census::freed_by(|| drop(inferred_params))),
+            ("declared_signatures", crate::memory_census::freed_by(|| drop(declared_signatures))),
+            ("adapter", crate::memory_census::freed_by(|| drop(adapter))),
+            ("concern_folded", crate::memory_census::freed_by(|| drop(concern_folded))),
+            ("host_folded", crate::memory_census::freed_by(|| drop(host_folded))),
+            ("catalog_lent", crate::memory_census::freed_by(|| drop(catalog_lent))),
+            ("extension_modules", crate::memory_census::freed_by(|| drop(extension_modules))),
+            ("inquirers", crate::memory_census::freed_by(|| drop(inquirers))),
+            ("load_hook_bases", crate::memory_census::freed_by(|| drop(load_hook_bases))),
+            ("i18n", crate::memory_census::freed_by(|| drop(i18n))),
+            ("helper_modules", crate::memory_census::freed_by(|| drop(helper_modules))),
+            ("open_classes", crate::memory_census::freed_by(|| drop(open_classes))),
+            ("refined_action_bindings", crate::memory_census::freed_by(|| drop(refined_action_bindings))),
+            ("const_resolver", crate::memory_census::freed_by(|| drop(const_resolver))),
+            ("gem_sources", crate::memory_census::freed_by(|| drop(gem_sources))),
+            ("extensions", crate::memory_census::freed_by(|| drop(extensions))),
+            ("typed_constants", crate::memory_census::freed_by(|| drop(typed_constants))),
+            ("data_factories", crate::memory_census::freed_by(|| drop(data_factories))),
+            ("recursive_methods", crate::memory_census::freed_by(|| drop(recursive_methods))),
+            ("incremental", crate::memory_census::freed_by(|| drop(incremental))),
+            ("param_tables", crate::memory_census::freed_by(|| drop(param_tables))),
+            ("site_cache", crate::memory_census::freed_by(|| drop(site_cache))),
+            ("const_memo", crate::memory_census::freed_by(|| drop(const_memo))),
+            ("return_cache", crate::memory_census::freed_by(|| drop(return_cache))),
+            ("setup_scan", crate::memory_census::freed_by(|| drop(setup_scan))),
+            ("init_memo", crate::memory_census::freed_by(|| drop(init_memo))),
+            ("class_factories", crate::memory_census::freed_by(|| drop(class_factories))),
+            ("data_factories_without_custom_initialize", crate::memory_census::freed_by(|| drop(data_factories_without_custom_initialize))),
+            ("view_seeds", crate::memory_census::freed_by(|| drop(view_seeds))),
+            ("callers_by_target", crate::memory_census::freed_by(|| drop(callers_by_target))),
+            ("controller_action_meta_cache", crate::memory_census::freed_by(|| drop(controller_action_meta_cache))),
+            ("fixpoint_checks", crate::memory_census::freed_by(|| drop(fixpoint_checks))),
+        ];
+        let total: i64 = freed.iter().map(|(_, bytes)| bytes).sum();
+        freed.sort_by_key(|(name, bytes)| (-bytes, *name));
+        for (name, bytes) in freed.iter().filter(|(_, bytes)| *bytes >= 1_000_000) {
+            crate::memory_census::note("analyzer", format_args!("field {name}: {:.1}MB", *bytes as f64 / 1e6));
+        }
+        crate::memory_census::note("analyzer", format_args!("total {:.1}MB", total as f64 / 1e6));
+    }
+}

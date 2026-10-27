@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Check a compile's memory against the budget in ci/memory-budget.json.
+
+Reads the `roundhouse-timing:` lines of two runs of a build with the
+`memory-census` feature, one on a small synthetic app and one on a large
+one (`scripts/synth-app`), and fails when either run's peak, or the
+growth between them, exceeds the budget:
+
+    scripts/memory-budget --budget ci/memory-budget.json \\
+        --small small.log --large large.log
+
+The growth per pack is the number that says whether memory stays flat
+as the app grows; the peaks say how much the compile costs at a given
+size. Live heap is the counting allocator's exact high-water mark;
+anonymous RSS adds what the allocator keeps from the system. VmHWM is
+not used, since it also counts file-backed pages.
+
+`--record` prints a budget for the measured runs instead of checking
+one, for a change that lowers the cost on purpose.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+LIVE_PEAK = re.compile(r"live peak (\d+) MB")
+RSS_ANON = re.compile(r"rss anon (\d+) MB")
+PHASE = re.compile(r"^roundhouse-timing: (.+): [0-9.]+s \(")
+
+
+def measure(log_path):
+    """The largest live peak and anonymous RSS any timing line reports,
+    and the phase whose line first reports the live peak."""
+    live_peak = 0
+    rss_anon = 0
+    phase_at_peak = None
+    with open(log_path, encoding="utf-8", errors="replace") as log:
+        for line in log:
+            if not line.startswith("roundhouse-timing: "):
+                continue
+            live = LIVE_PEAK.search(line)
+            if live and int(live.group(1)) > live_peak:
+                live_peak = int(live.group(1))
+                phase = PHASE.match(line)
+                phase_at_peak = phase.group(1) if phase else None
+            anon = RSS_ANON.search(line)
+            if anon:
+                rss_anon = max(rss_anon, int(anon.group(1)))
+    if live_peak == 0:
+        sys.exit(f"memory-budget: {log_path} has no `live peak` timing lines; "
+                 "was it a `memory-census` build run with ROUNDHOUSE_TIMINGS=1?")
+    return {"live_peak_mb": live_peak, "rss_anon_peak_mb": rss_anon, "phase_at_live_peak": phase_at_peak}
+
+
+def growth(small, large, packs_small, packs_large, key):
+    return (large[key] - small[key]) / (packs_large - packs_small)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--budget", required=True)
+    parser.add_argument("--small", required=True, help="timing log of the small app")
+    parser.add_argument("--large", required=True, help="timing log of the large app")
+    parser.add_argument("--record", action="store_true", help="print a budget for these runs")
+    arguments = parser.parse_args(argv)
+
+    with open(arguments.budget, encoding="utf-8") as handle:
+        budget = json.load(handle)
+    packs_small = budget["small"]["packs"]
+    packs_large = budget["large"]["packs"]
+    small = measure(arguments.small)
+    large = measure(arguments.large)
+    measured = {
+        "small": small,
+        "large": large,
+        "growth_per_pack_mb": {
+            key: round(growth(small, large, packs_small, packs_large, key), 2)
+            for key in ("live_peak_mb", "rss_anon_peak_mb")
+        },
+    }
+
+    if arguments.record:
+        recorded = dict(budget)
+        for size in ("small", "large"):
+            recorded[size] = {
+                "packs": budget[size]["packs"],
+                "live_peak_mb": measured[size]["live_peak_mb"],
+                "rss_anon_peak_mb": measured[size]["rss_anon_peak_mb"],
+            }
+        recorded["growth_per_pack_mb"] = measured["growth_per_pack_mb"]
+        print(json.dumps(recorded, indent=2))
+        return 0
+
+    tolerance = budget["tolerance"]
+    rows = []
+    failures = []
+
+    def check(label, value, allowed_base, tolerance):
+        allowed = allowed_base * (1 + tolerance)
+        within = value <= allowed
+        rows.append((label, value, allowed_base, allowed, within))
+        if not within:
+            failures.append(f"{label}: {value} MB is over the budget of {allowed_base} MB (+{tolerance:.0%})")
+
+    for size in ("small", "large"):
+        for key, label in (("live_peak_mb", "live heap peak"), ("rss_anon_peak_mb", "anonymous RSS peak")):
+            check(f"{size} app ({budget[size]['packs']} packs) {label}", measured[size][key], budget[size][key], tolerance[key])
+    for key, label in (("live_peak_mb", "live heap"), ("rss_anon_peak_mb", "anonymous RSS")):
+        check(f"{label} growth per pack", measured["growth_per_pack_mb"][key], budget["growth_per_pack_mb"][key], tolerance[key])
+
+    report = ["| Measure | Measured (MB) | Budget (MB) | Allowed (MB) | |", "|---|---:|---:|---:|---|"]
+    for label, value, base, allowed, within in rows:
+        report.append(f"| {label} | {value} | {base} | {allowed:.1f} | {'ok' if within else 'over'} |")
+    report.append("")
+    report.append(f"Live heap peaked in `{small['phase_at_live_peak']}` (small) and `{large['phase_at_live_peak']}` (large).")
+    text = "\n".join(report)
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write("## Memory budget\n\n" + text + "\n")
+    if failures:
+        for failure in failures:
+            print(f"memory-budget: {failure}", file=sys.stderr)
+        print("memory-budget: if the increase is intended, rerun with --record and commit the new "
+              "budget with a line in the PR saying why it went up.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -34,6 +34,46 @@ fn peak_rss_mb() -> Option<u64> {
     None
 }
 
+/// Resident anonymous memory now: the heap and stacks, without the
+/// file-backed pages (mapped files, the binary) that VmHWM also counts.
+#[cfg(target_os = "linux")]
+fn rss_anon_mb() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find(|line| line.starts_with("RssAnon:"))
+                .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+        })
+        .map(|kb| kb / 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rss_anon_mb() -> Option<u64> {
+    None
+}
+
+/// The measurements after a phase's time: peak RSS, then (where the
+/// platform reports it) current anonymous RSS, then, with the
+/// `memory-census` feature, live heap bytes and their high-water mark.
+fn memory_summary() -> String {
+    let mut summary = match peak_rss_mb() {
+        Some(mb) => format!("peak rss {mb} MB"),
+        None => "peak rss unavailable".to_string(),
+    };
+    if let Some(mb) = rss_anon_mb() {
+        summary.push_str(&format!(", rss anon {mb} MB"));
+    }
+    #[cfg(feature = "memory-census")]
+    summary.push_str(&format!(
+        ", live heap {} MB, live peak {} MB",
+        crate::memory_census::live_bytes() / 1_000_000,
+        crate::memory_census::peak_bytes() / 1_000_000,
+    ));
+    summary
+}
+
 /// Run a phase and print measurements only when requested.
 ///
 /// Resets the lap boundary afterward so a following `lap` does not
@@ -95,17 +135,11 @@ pub struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        match peak_rss_mb() {
-            Some(mb) => eprintln!(
-                "roundhouse-timing: {}: {:.2}s (peak rss {mb} MB)",
-                self.name,
-                self.start.elapsed().as_secs_f64(),
-            ),
-            None => eprintln!(
-                "roundhouse-timing: {}: {:.2}s (peak rss unavailable)",
-                self.name,
-                self.start.elapsed().as_secs_f64(),
-            ),
-        }
+        eprintln!(
+            "roundhouse-timing: {}: {:.2}s ({})",
+            self.name,
+            self.start.elapsed().as_secs_f64(),
+            memory_summary(),
+        );
     }
 }

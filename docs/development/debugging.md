@@ -67,6 +67,28 @@ ROUNDHOUSE_TIMINGS=1 cargo test --test emit_and_run the_unedited_blog_runs -- --
 ```
 
 Timing is opt-in; a process high-water RSS is not per-phase allocated memory.
+On Linux each line also reports the current anonymous RSS (`rss anon`),
+which leaves out file-backed pages.
+
+To see what holds the heap, build with the `memory-census` feature. Each
+timing line then adds the exact live heap and its high-water mark, and
+`ROUNDHOUSE_MEMORY_CENSUS=1` prints the size of every `App` field, the
+body/header split of the unit collections, IR node counts and the
+analyzer's fields after ingest, analysis, the post-analyze lowerings and
+emit:
+
+```sh
+cargo build --bin roundhouse --features memory-census
+scripts/synth-app /tmp/synth --packs 50
+ROUNDHOUSE_TIMINGS=1 ROUNDHOUSE_MEMORY_CENSUS=1 \
+  target/debug/roundhouse --target ruby --survey --allow-unsupported -o /tmp/synth-out /tmp/synth
+```
+
+`scripts/memory-budget` checks two such runs, on two sizes of
+`scripts/synth-app`, and fails when the peak, or its growth per pack,
+exceeds `ci/memory-budget.json`. A change that lowers memory updates the
+budget with `scripts/memory-budget --record`; raising it needs a reason in
+the PR.
 Other debugging controls are discoverable at their readers:
 `rg -n 'ROUNDHOUSE_' src/ scripts/`. Matches include comments and generated
 code; inspect the actual read before assuming a variable is live.
