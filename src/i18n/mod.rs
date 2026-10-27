@@ -14,6 +14,9 @@ use serde_yaml_ng::Value;
 pub mod gems;
 pub mod plural;
 pub mod rails_i18n;
+pub mod table;
+
+use table::{Entries, Order};
 
 /// Rails 8.1.4's bundled English, in the order its frameworks load it.
 const RAILS_EN: &[(&str, &str)] = &[
@@ -34,15 +37,15 @@ pub struct Catalog {
     /// `config.i18n.default_locale`, `en` when the app sets none.
     pub locale: String,
     /// Dotted key (`activerecord.attributes.user.email`) → string leaf.
-    pub entries: BTreeMap<String, String>,
+    pub entries: Entries,
     /// Keys whose value is not a String (an Array, a number, a boolean):
     /// I18n answers them as they are, which `entries` cannot hold.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub opaque: std::collections::BTreeSet<String>,
     /// Each node's children in the order the files give them, as the
     /// deep merge of Ruby Hashes keeps it ("" for the locale's root).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub order: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Order::is_empty")]
+    pub order: Order,
     /// What a translation the locale lacks does, per environment.
     #[serde(default)]
     pub missing: MissingPolicy,
@@ -243,6 +246,30 @@ impl Catalog {
         self.fallbacks = fallbacks;
     }
 
+    /// Packs this catalog and the other locales' catalogs against one
+    /// shared, sorted table of their keys, once loading is done: the
+    /// locales repeat nearly every key and node, and only the values
+    /// differ (see [`table`]). Every read answers as before; a later
+    /// merge unpacks the catalog it merges into.
+    pub fn freeze(&mut self) {
+        let shared = {
+            let mut keys = std::collections::BTreeSet::new();
+            let mut paths = std::collections::BTreeSet::new();
+            for catalog in std::iter::once(&*self).chain(self.others.iter()) {
+                catalog.entries.key_set(&mut keys);
+                catalog.order.key_set(&mut paths);
+            }
+            keys.extend(paths.iter().map(String::as_str));
+            std::sync::Arc::new(table::KeyTable::new(keys))
+        };
+        self.entries = self.entries.freeze(&shared);
+        self.order = self.order.freeze(&shared);
+        for other in &mut self.others {
+            other.entries = other.entries.freeze(&shared);
+            other.order = other.order.freeze(&shared);
+        }
+    }
+
     fn merge_source(&mut self, source: &str) -> Result<(), String> {
         let top = format!("{}:", self.locale);
         let quoted = [format!("\"{}\":", self.locale), format!("'{}':", self.locale)];
@@ -253,13 +280,13 @@ impl Catalog {
         let mut value: Value = serde_yaml_ng::from_str(source).map_err(|e| e.to_string())?;
         value.apply_merge().map_err(|e| e.to_string())?;
         if let Some(tree) = value.get(self.locale.as_str()) {
-            flatten(tree, String::new(), &mut Flat { entries: &mut self.entries, opaque: &mut self.opaque, order: &mut self.order });
+            flatten(tree, String::new(), &mut Flat { entries: self.entries.building(), opaque: &mut self.opaque, order: self.order.building() });
         }
         Ok(())
     }
 
     pub fn lookup(&self, key: &str) -> Option<&str> {
-        self.entries.get(key).map(String::as_str)
+        self.entries.get(key)
     }
 
     /// `key`, or with a `count` its plural form for English (`zero` when
@@ -299,7 +326,7 @@ impl Catalog {
             .entries
             .iter()
             .filter(|(k, _)| prefixes.iter().any(|p| k.starts_with(p.as_str())))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Catalog { locale: self.locale.clone(), entries, ..Default::default() }
     }
@@ -631,7 +658,7 @@ impl Catalog {
 /// Whether `key` has entries beneath it.
     pub fn is_subtree(&self, key: &str) -> bool {
         let below = format!("{key}.");
-        self.order.contains_key(key) || self.entries.range(below.clone()..).next().is_some_and(|(k, _)| k.starts_with(&below))
+        self.order.contains_key(key) || self.entries.range_from(&below).next().is_some_and(|(k, _)| k.starts_with(&below))
     }
 
     /// Whether `key` is a subtree holding only Strings (and empty
@@ -643,12 +670,13 @@ impl Catalog {
 
     /// Every String leaf and every empty mapping (`None`), in the order
     /// the files give them, as a Ruby Hash built from them iterates.
-    pub fn ordered_nodes(&self) -> Vec<(String, Option<&String>)> {
+    pub fn ordered_nodes(&self) -> Vec<(String, Option<&str>)> {
         let mut out = Vec::new();
         let mut seen = crate::det::HashSet::default();
-        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(String, Option<&'a String>)>, seen: &mut crate::det::HashSet<String>) {
-            for child in c.order.get(node).into_iter().flatten() {
-                let path = if node.is_empty() { child.clone() } else { format!("{node}.{child}") };
+        fn walk<'a>(c: &'a Catalog, node: &str, out: &mut Vec<(String, Option<&'a str>)>, seen: &mut crate::det::HashSet<String>) {
+            let Some(children) = c.order.get(node) else { return };
+            for child in children.iter() {
+                let path = table::child_path(node, child);
                 if let Some(v) = c.entries.get(&path) {
                     if seen.insert(path.clone()) {
                         out.push((path, Some(v)));
@@ -663,9 +691,9 @@ impl Catalog {
             }
         }
         walk(self, "", &mut out, &mut seen);
-        for (k, v) in &self.entries {
-            if seen.insert(k.clone()) {
-                out.push((k.clone(), Some(v)));
+        for (k, v) in self.entries.iter() {
+            if seen.insert(k.to_string()) {
+                out.push((k.to_string(), Some(v)));
             }
         }
         out
@@ -682,10 +710,10 @@ impl Catalog {
         let under = |k: &str| k.starts_with(base) || k == stem;
         let mut nodes: Vec<String> = Vec::new();
         // Not every key filtered: the ones under `base` sit together in the sorted map, and `stem` (base without its dot) sorts before them.
-        let within = self.entries.range(base.to_string()..).map(|(k, _)| k).take_while(|k| k.starts_with(base));
+        let within = self.entries.range_from(base).map(|(k, _)| k).take_while(|k| k.starts_with(base));
         let at_stem = self.entries.get_key_value(stem).map(|(k, _)| k).filter(|k| !k.starts_with(base));
         for key in at_stem.into_iter().chain(within) {
-            let mut node = key.as_str();
+            let mut node = key;
             nodes.push(node.to_string());
             while let Some((parent, _)) = node.rsplit_once('.') {
                 if !under(parent) {
@@ -1105,9 +1133,14 @@ mod tests {
 
     fn catalog(files: &[(&str, &str)]) -> Catalog {
         let mut files = files.iter().map(|(p, s)| (p.to_string(), s.to_string())).collect();
-        let (catalog, problems) = Catalog::load("en", &mut files);
+        let (loaded, problems) = Catalog::load("en", &mut files);
         assert!(problems.is_empty(), "{problems:?}");
-        catalog
+        // Every test reads the packed form ingest leaves; it must answer as the loaded one does.
+        let mut frozen = loaded.clone();
+        frozen.freeze();
+        assert_eq!(frozen, loaded);
+        assert_eq!(frozen.ordered_nodes(), loaded.ordered_nodes());
+        frozen
     }
 
     fn keys(k: &[&str]) -> Vec<String> {
@@ -1211,9 +1244,8 @@ mod tests {
         assert!(c.is_subtree("feed"));
         assert!(c.plain_subtree("feed"));
         assert!(c.plain_subtree("menu"));
-        let home = "Home".to_string();
         let ours: Vec<_> = c.ordered_nodes().into_iter().filter(|(k, _)| k == "feed" || k.starts_with("menu.")).collect();
-        assert_eq!(ours, vec![("feed".to_string(), None), ("menu.more".to_string(), None), ("menu.home".to_string(), Some(&home))]);
+        assert_eq!(ours, vec![("feed".to_string(), None), ("menu.more".to_string(), None), ("menu.home".to_string(), Some("Home"))]);
     }
 
     #[test]
@@ -1269,6 +1301,7 @@ mod tests {
         let (mut c, _) = Catalog::load("en", &mut files);
         let policy = FallbackPolicy { app: Some(keys(&["en"])), ..Default::default() };
         c.load_locales(keys(&["en", "pl"]), policy, &[], &mut files);
+        c.freeze();
         let en = Some(&["en".to_string()][..]);
         let t = |key: &str, defaults: Vec<Fallback>| Translate { key: key.into(), defaults, ..Default::default() };
         let one = |s: &str| Ok(Translation::One(s.into()));

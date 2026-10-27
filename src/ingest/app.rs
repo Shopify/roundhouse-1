@@ -2982,6 +2982,7 @@ end
     catalog.available_unknown = available_unknown;
     catalog.field_error_proc = field_error_proc_file(vfs, dir);
     catalog.plurals = plural_rules(vfs, dir, app.gem_lock.as_ref(), &catalog);
+    catalog.freeze();
     // Shared, not copied, by the analyzer and the lowerings that read it:
     // on a large app the catalog is hundreds of megabytes.
     app.i18n = std::sync::Arc::new(catalog);
