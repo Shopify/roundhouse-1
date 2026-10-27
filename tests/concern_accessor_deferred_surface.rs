@@ -216,10 +216,17 @@ fn a_confirmed_compile_writes_the_probes_tree_without_probing_in_ingest() {
     let phases: Vec<&str> = report
         .lines()
         .filter_map(|line| line.strip_prefix("roundhouse-timing: "))
-        .filter(|line| line.starts_with("concern-accessor-surface:") || line.starts_with("ingest:"))
+        .filter_map(|line| ["concern-accessor-surface", "ingest"].into_iter().find(|phase| timed_phase(line, phase)))
         .collect();
-    assert_eq!(phases.len(), 2, "{report}");
-    assert!(phases[0].starts_with("ingest:"), "the surface is observed after ingest: {report}");
+    assert_eq!(phases, ["ingest", "concern-accessor-surface"], "the surface is observed after ingest: {report}");
+}
+
+/// Whether a timing line reports `phase` itself, not a sub-phase such as
+/// `ingest: compact`: the phase name is followed directly by its duration.
+fn timed_phase(line: &str, phase: &str) -> bool {
+    line.strip_prefix(phase)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .is_some_and(|duration| duration.starts_with(|character: char| character.is_ascii_digit()))
 }
 
 #[test]
