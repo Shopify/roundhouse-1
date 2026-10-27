@@ -900,14 +900,14 @@ fn merge_text(parts: Vec<Part>) -> Vec<Part> {
 /// by the param key a form names it with (`article`, `admin_user`).
 #[derive(Clone, Debug, Default)]
 pub struct FormI18n {
-    catalog: Catalog,
+    catalog: std::sync::Arc<Catalog>,
     models: crate::det::HashMap<String, ModelI18n>,
 }
 
 impl FormI18n {
     pub fn of(app: &crate::app::App) -> Self {
         FormI18n {
-            catalog: app.i18n.clone(),
+            catalog: std::sync::Arc::clone(&app.i18n),
             models: app
                 .models
                 .iter()
