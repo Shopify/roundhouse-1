@@ -16513,6 +16513,14 @@ pub(crate) fn lock_loaded_gems(
             .filter(|gem| gem.envs.is_empty() || gem.envs.iter().any(|e| e == "test"))
             .map(|gem| gem.name.as_str()),
     );
+    // runtime/gem_facades.rb requires "opentelemetry" wherever the lock
+    // pins opentelemetry-api (`open_telemetry_require`), so that gem and
+    // what requiring it loads are loaded on every such tree, extension
+    // facts or not: a `#: OpenTelemetry::Trace::Tracer` declared type
+    // names a constant the tree has.
+    if lock.has("opentelemetry-api") {
+        stack.push("opentelemetry-api");
+    }
     for (gem, deps) in GEM_REQUIRE_DEPENDENCIES {
         if lock.has(gem) {
             loaded.insert(gem.to_string());
