@@ -667,7 +667,7 @@ pub fn census(stage: &str, app: &crate::App) {
             "belongs_to_required_skips_unchanged_foreign_key",
             live_delta(|| belongs_to_required_skips_unchanged_foreign_key.clone()),
         ),
-        ("const_resolver", live_delta(|| const_resolver.clone())),
+        ("const_resolver", const_resolver.census_bytes()),
         ("dropped_files", live_delta(|| dropped_files.clone())),
         (
             "sorbet_type_aliases",

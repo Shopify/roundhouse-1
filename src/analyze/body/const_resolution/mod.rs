@@ -44,6 +44,7 @@ const MODELED_CORE: &[&str] = &[
 
 const RUNTIME_URI_PREFIX: &str = "roundhouse-runtime:";
 
+#[cfg_attr(feature = "memory-census", derive(Clone))]
 pub(super) enum ResolvedConstant {
     /// `stdlib`: only Ruby's signatures declare it ([`is_stdlib_only`]).
     /// `alias`: the name written resolved through an RBS class alias
@@ -91,6 +92,32 @@ struct FileAnswers {
     singleton_owners: HashSet<Box<str>>,
 }
 
+/// The identity map's hasher is not `Clone`, so its entries are copied.
+#[cfg(feature = "memory-census")]
+impl Clone for FileAnswers {
+    fn clone(&self) -> Self {
+        FileAnswers {
+            references: self.references.clone(),
+            unresolved_nesting: self.unresolved_nesting.clone(),
+            class_references: self.class_references.clone(),
+            namespace_bodies: self.namespace_bodies.clone(),
+            constants: self.constants.clone(),
+            constant_classes: self.constant_classes.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            namespace_definitions: self.namespace_definitions.clone(),
+            class_definitions: self.class_definitions.clone(),
+            alias_definitions: self.alias_definitions.clone(),
+            runtime_namespace_aliases: self.runtime_namespace_aliases.clone(),
+            namespace_aliases: self.namespace_aliases.clone(),
+            superclasses: self.superclasses.clone(),
+            unindexed_singletons: self.unindexed_singletons.clone(),
+            sole_namespaces: self.sole_namespaces.clone(),
+            singleton_methods: self.singleton_methods.clone(),
+            singleton_owners: self.singleton_owners.clone(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "memory-census", derive(Clone))]
 pub(crate) struct ConstResolver {
     /// Indexed by `FileId - 1`. `None` marks a source that Rubydex did
     /// not index, such as an ERB template.
@@ -838,6 +865,13 @@ impl ConstResolver {
 pub struct PreparedConstResolver(Option<Arc<ConstResolver>>);
 
 impl PreparedConstResolver {
+    /// The bytes the prepared answers hold. The handle is an `Arc`, so
+    /// cloning it measures nothing; this copies the answers themselves.
+    #[cfg(feature = "memory-census")]
+    pub(crate) fn census_bytes(&self) -> i64 {
+        crate::memory_census::live_delta(|| self.0.as_deref().cloned())
+    }
+
     /// The answers that ingest prepared, if they cover these sources.
     /// Cloning an app retains the cache, but callers can edit its public
     /// sources. Rebuild when paths, text or file order have changed.

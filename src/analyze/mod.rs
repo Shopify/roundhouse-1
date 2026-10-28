@@ -1689,6 +1689,14 @@ impl Analyzer {
         &self.classes
     }
 
+    /// The class registry, with everything else the analysis kept
+    /// dropped: the lowerings read only the registry, and the rest (the
+    /// incremental state, the call-site and constant caches) is gigabytes
+    /// on a large app.
+    pub fn into_class_registry(self) -> HashMap<ClassId, ClassInfo> {
+        self.classes
+    }
+
     /// The most rounds one constant registry build of the last
     /// [`Self::analyze`] took to settle its values.
     pub fn constant_rounds(&self) -> usize {
@@ -2243,6 +2251,7 @@ impl Analyzer {
         // the same bodies two or three times per round for no harvest
         // or unify input.
         self.stamp_body_effects(app);
+        crate::timings::lap_start();
 
         // Publish the converged param table onto the App for lowerings
         // that build signatures after analysis (the controller lowering
@@ -2262,12 +2271,14 @@ impl Analyzer {
         for lc in app.library_classes.iter().filter(|lc| helper_modules.contains(&lc.name)) {
             for m in &lc.methods {
                 let mut targets = Vec::new();
-                render::extract_partial_render_sites(
-                    &m.body,
-                    &Symbol::from("application/_helper"),
-                    &mut helper_sites,
-                    &mut targets,
-                );
+                m.body.with_expr(|body| {
+                    render::extract_partial_render_sites(
+                        body,
+                        &Symbol::from("application/_helper"),
+                        &mut helper_sites,
+                        &mut targets,
+                    )
+                });
             }
         }
         for (partial, locals) in helper_sites {
@@ -2282,10 +2293,13 @@ impl Analyzer {
         // Direct-helper bodies last: they are the one app-authored
         // expression the fixpoint above never touches, and typing them
         // needs the registry it produces.
+        crate::timings::lap("after analysis: helper partial sites");
         self.type_direct_helper_bodies(app);
         self.type_rails_application_body(app);
+        crate::timings::lap("after analysis: direct helpers and application body");
 
         self.stamp_inferred_method_signatures(app);
+        crate::timings::lap("after analysis: inferred signatures");
         self.report_fixpoint_checks(app);
         // What the steps since the effects stamp read or retyped goes
         // back to the store too, so analysis hands over stored bodies.
@@ -2521,7 +2535,10 @@ impl Analyzer {
                     .and_then(|t| t.get(&method.name))
                     .filter(|t| !matches!(t, Ty::Fn { .. }))
                     .cloned()
-                    .or_else(|| effective_return_ty(&method.body))
+                    // Decoded for the read and not kept: after the effects stamp
+                    // every body is in the store, and keeping each one read here
+                    // brought them all back to the heap at once.
+                    .or_else(|| method.body.with_expr(effective_return_ty))
                     .filter(|t| !matches!(t, Ty::Var { .. } | Ty::Untyped));
 
                 if !has_params && ret.is_none() {
@@ -11631,12 +11648,14 @@ fn expr_calls_super(body: &Expr) -> bool {
 #[cfg(feature = "memory-census")]
 impl Analyzer {
     /// Drop the analyzer one field at a time and report what each held
-    /// (`ROUNDHOUSE_MEMORY_CENSUS=1`). Destructured without `..`, so a new
-    /// field has to be listed here; the `Copy` flags and counters own no heap.
-    pub fn census_drop(self) {
+    /// (`ROUNDHOUSE_MEMORY_CENSUS=1`), keeping the class registry the
+    /// lowerings read, as [`Analyzer::into_class_registry`] does; its size
+    /// is measured on a copy. Destructured without `..`, so a new field has
+    /// to be listed here; the `Copy` flags and counters own no heap.
+    pub fn census_drop(self) -> HashMap<ClassId, ClassInfo> {
         let Analyzer { classes, inferred_params, declared_signatures, adapter, concern_folded, host_folded, catalog_lent, extension_modules, inquirers, load_hook_bases, i18n, i18n_gem: _, helper_modules, open_classes, refined_action_bindings, const_resolver, source_indexed: _, gem_sources, extensions, typed_constants, data_factories, recursive_methods, fixpoint_rounds: _, constant_rounds: _, incremental, param_tables, site_cache, const_memo, return_cache, block_value_candidates, setup_scan, init_memo, class_factories, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_checks, store: _ } = self;
         let mut freed: Vec<(&str, i64)> = vec![
-            ("classes", crate::memory_census::freed_by(|| drop(classes))),
+            ("classes (kept)", crate::memory_census::live_delta(|| classes.clone())),
             ("inferred_params", crate::memory_census::freed_by(|| drop(inferred_params))),
             ("declared_signatures", crate::memory_census::freed_by(|| drop(declared_signatures))),
             ("adapter", crate::memory_census::freed_by(|| drop(adapter))),
@@ -11677,5 +11696,6 @@ impl Analyzer {
             crate::memory_census::note("analyzer", format_args!("field {name}: {:.1}MB", *bytes as f64 / 1e6));
         }
         crate::memory_census::note("analyzer", format_args!("total {:.1}MB", total as f64 / 1e6));
+        classes
     }
 }

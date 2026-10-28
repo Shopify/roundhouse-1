@@ -47,12 +47,16 @@ pub fn analyze_and_lower(app: &mut App) -> Vec<Diagnostic> {
         #[cfg(feature = "memory-census")]
         crate::memory_census::census("after analyze", app);
         app.helper_diagnostics = Some(crate::analyze::diagnose_helper_modules(app));
+        // Only the registry outlives the analysis.
+        #[cfg(feature = "memory-census")]
+        let registry = if crate::memory_census::enabled() { analyzer.census_drop() } else { analyzer.into_class_registry() };
+        #[cfg(not(feature = "memory-census"))]
+        let registry = analyzer.into_class_registry();
         let diagnostics = crate::timings::phase("post-analyze lowerings", || {
-            crate::lower::apply_post_analyze_lowerings(app, analyzer.class_registry())
+            crate::lower::apply_post_analyze_lowerings(app, &registry)
         });
         #[cfg(feature = "memory-census")]
         if crate::memory_census::enabled() {
-            analyzer.census_drop();
             crate::memory_census::census("after lowerings", app);
         }
         diagnostics
