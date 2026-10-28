@@ -138,7 +138,10 @@ impl Store {
                 "the directory is RAM-backed (tmpfs), so stored bodies would stay in memory; set ROUNDHOUSE_STORE_DIR to a directory on disk",
             ));
         }
-        let path = directory.join(format!("roundhouse-store-{}", std::process::id()));
+        // Unique within the process too: two stores created at once (the
+        // tests below run in parallel) must not race for one name.
+        static CREATED: AtomicU64 = AtomicU64::new(0);
+        let path = directory.join(format!("roundhouse-store-{}-{}", std::process::id(), CREATED.fetch_add(1, Ordering::Relaxed)));
         let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
         std::fs::remove_file(&path)?;
         Ok(Store {
@@ -269,6 +272,24 @@ mod tests {
         assert!(spilled.resident().is_none(), "a spilled body leaves the heap");
         assert_eq!(serde_json::to_vec(&*spilled).unwrap(), serde_json::to_vec(&*original).unwrap());
         assert_eq!(spilled.with_expr(|expr| expr.span), original.span);
+    }
+
+    #[test]
+    fn a_float_literal_reads_back_as_the_same_number() {
+        let Some(store) = store(false) else { return };
+        // Without serde_json's `float_roundtrip`, this decodes one unit in
+        // the last place low.
+        let value = 116.47000000812113_f64;
+        let mut spilled = Body::new(Expr::new(
+            crate::span::Span::synthetic(),
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Float { value } },
+        ));
+        spilled.spill(&store);
+        let read = spilled.with_expr(|expr| match &*expr.node {
+            crate::expr::ExprNode::Lit { value: crate::expr::Literal::Float { value } } => *value,
+            other => panic!("not a float literal: {other:?}"),
+        });
+        assert_eq!(read.to_bits(), value.to_bits(), "{read} read back for {value}");
     }
 
     #[test]
