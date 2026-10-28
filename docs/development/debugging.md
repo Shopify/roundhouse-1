@@ -71,11 +71,13 @@ On Linux each line also reports the current anonymous RSS (`rss anon`),
 which leaves out file-backed pages.
 
 To see what holds the heap, build with the `memory-census` feature. Each
-timing line then adds the exact live heap and its high-water mark, and
-`ROUNDHOUSE_MEMORY_CENSUS=1` prints the size of every `App` field, the
-body/header split of the unit collections, IR node counts and the
-analyzer's fields after ingest, analysis, the post-analyze lowerings and
-emit:
+timing line then adds the exact live heap, its high-water mark over the
+run so far (`live peak`), and the high-water mark within that phase or
+lap alone (`phase peak`), so a late phase's own cost shows even when an
+earlier phase peaked higher. `ROUNDHOUSE_MEMORY_CENSUS=1` prints the
+size of every `App` field, the body/header split of the unit
+collections, IR node counts and the analyzer's fields after ingest,
+analysis, the post-analyze lowerings and emit:
 
 ```sh
 cargo build --bin roundhouse --features memory-census

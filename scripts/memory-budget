@@ -26,28 +26,38 @@ import re
 import sys
 
 LIVE_PEAK = re.compile(r"live peak (\d+) MB")
+PHASE_PEAK = re.compile(r"phase peak (\d+) MB")
 RSS_ANON = re.compile(r"rss anon (\d+) MB")
 PHASE = re.compile(r"^roundhouse-timing: (.+): [0-9.]+s \(")
 
 
 def measure(log_path):
     """The largest live peak and anonymous RSS any timing line reports,
-    and the phase whose line first reports the live peak."""
+    and the phase the live peak happened in: the first line whose own
+    `phase peak` reaches it (inner phases print before the phases that
+    hold them), or, for a log without phase peaks, the first line to
+    report it."""
     live_peak = 0
     rss_anon = 0
     phase_at_peak = None
+    phase_peaks = []
     with open(log_path, encoding="utf-8", errors="replace") as log:
         for line in log:
             if not line.startswith("roundhouse-timing: "):
                 continue
+            phase = PHASE.match(line)
+            name = phase.group(1) if phase else None
             live = LIVE_PEAK.search(line)
             if live and int(live.group(1)) > live_peak:
                 live_peak = int(live.group(1))
-                phase = PHASE.match(line)
-                phase_at_peak = phase.group(1) if phase else None
+                phase_at_peak = name
+            own = PHASE_PEAK.search(line)
+            if own:
+                phase_peaks.append((int(own.group(1)), name))
             anon = RSS_ANON.search(line)
             if anon:
                 rss_anon = max(rss_anon, int(anon.group(1)))
+    phase_at_peak = next((name for own, name in phase_peaks if own >= live_peak), phase_at_peak)
     if live_peak == 0:
         sys.exit(f"memory-budget: {log_path} has no `live peak` timing lines; "
                  "was it a `memory-census` build run with ROUNDHOUSE_TIMINGS=1?")

@@ -19,11 +19,17 @@ struct Counting;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicIsize = AtomicIsize::new(0);
+/// The high-water mark since the open windows last took it (see
+/// [`open_window`]). Never above `PEAK`.
+static SINCE: AtomicIsize = AtomicIsize::new(0);
 
 fn grew(by: isize) {
     let now = LIVE.fetch_add(by, Ordering::Relaxed) + by;
-    if now > PEAK.load(Ordering::Relaxed) {
-        PEAK.fetch_max(now, Ordering::Relaxed);
+    if now > SINCE.load(Ordering::Relaxed) {
+        SINCE.fetch_max(now, Ordering::Relaxed);
+        if now > PEAK.load(Ordering::Relaxed) {
+            PEAK.fetch_max(now, Ordering::Relaxed);
+        }
     }
 }
 
@@ -69,6 +75,44 @@ pub fn live_bytes() -> i64 {
 /// The most live heap bytes seen so far.
 pub fn peak_bytes() -> i64 {
     PEAK.load(Ordering::Relaxed) as i64
+}
+
+/// The windows open now: an id and the highest live heap seen since it
+/// opened, as of the last [`take_since`].
+static WINDOWS: std::sync::Mutex<Vec<(u64, i64)>> = std::sync::Mutex::new(Vec::new());
+static NEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Hand the high-water mark since the last call to every open window and
+/// start a new one from the live heap now. Windows can nest or overlap
+/// in any order, since each keeps its own maximum.
+fn take_since(windows: &mut [(u64, i64)]) {
+    let live = LIVE.load(Ordering::Relaxed);
+    let since = SINCE.swap(live, Ordering::Relaxed).max(live) as i64;
+    for (_, peak) in windows {
+        *peak = (*peak).max(since);
+    }
+}
+
+/// Start measuring the live heap's high-water mark from now, for a phase
+/// whose own peak [`close_window`] then returns. Unlike [`peak_bytes`],
+/// that peak leaves out whatever the heap reached before the phase.
+pub fn open_window() -> u64 {
+    let mut windows = WINDOWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    take_since(&mut windows);
+    let id = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
+    windows.push((id, live_bytes()));
+    id
+}
+
+/// The most live heap bytes seen since `open_window` returned `id`, and
+/// stop tracking it. Zero for an id that is not open.
+pub fn close_window(id: u64) -> i64 {
+    let mut windows = WINDOWS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    take_since(&mut windows);
+    match windows.iter().position(|(open, _)| *open == id) {
+        Some(index) => windows.swap_remove(index).1,
+        None => 0,
+    }
 }
 
 /// Whether `ROUNDHOUSE_MEMORY_CENSUS=1` asked for the census.
@@ -710,4 +754,38 @@ pub fn census(stage: &str, app: &crate::App) {
         stage,
         format_args!("census took {:.1}s", started.elapsed().as_secs_f64()),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK: usize = 256 << 20;
+
+    fn hold_block() {
+        let block = vec![1u8; BLOCK];
+        std::hint::black_box(&block);
+    }
+
+    #[test]
+    fn a_window_reports_its_own_peak_and_not_an_earlier_one() {
+        let outer = open_window();
+        let started = live_bytes();
+        let inner = open_window();
+        hold_block();
+        let inner_peak = close_window(inner);
+        let outer_peak = close_window(outer);
+        assert!(inner_peak >= started + BLOCK as i64, "inner {inner_peak}, started {started}");
+        assert!(outer_peak >= inner_peak, "outer {outer_peak}, inner {inner_peak}");
+
+        let later = open_window();
+        let later_peak = close_window(later);
+        assert!(later_peak < inner_peak - (BLOCK as i64) / 2, "later {later_peak}, inner {inner_peak}");
+        assert!(peak_bytes() >= inner_peak);
+    }
+
+    #[test]
+    fn closing_an_unknown_window_reports_nothing() {
+        assert_eq!(close_window(u64::MAX), 0);
+    }
 }
