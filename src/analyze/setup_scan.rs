@@ -13,6 +13,12 @@
 //! Replaying the same hits in the same order builds the same maps, so
 //! the result is the full scan's.
 //!
+//! With the unit store (`ROUNDHOUSE_STORE`), the library pass takes a
+//! class's hits right after typing it ([`SetupScan::record`]), while its
+//! bodies are on the heap, under the trees print it records; a class
+//! whose typing moved its trees is then kept by the next scan instead of
+//! being read back from the store.
+//!
 //! The hit and merge steps restate `harvest_mailer_with_params` and
 //! `collect_const_attr_writes`, and the walk order restates theirs
 //! (`for_each_hook_body_ref`, then views). `ROUNDHOUSE_INCREMENTAL=0`
@@ -222,7 +228,43 @@ fn other_hook_bodies(app: &App, models: bool, f: &mut impl FnMut(&Expr)) {
     }
 }
 
+/// One library class's hits, taken from its trees as they are now.
+fn library_hits(lc: &LibraryClass, print: Option<u64>, mailers: &HashSet<ClassId>, targets: &HashSet<&ClassId>) -> LibraryHits {
+    let mut mailer = Vec::new();
+    for method in &lc.methods {
+        method.body.with_expr(|body| mailer_hits(body, mailers, &mut mailer));
+    }
+    let mut writes = Vec::new();
+    if !targets.is_empty() {
+        library_hook_bodies(lc, &mut |body| attr_hits(body, targets, &mut writes));
+    }
+    LibraryHits { name: lc.name.clone(), print, mailer, writes }
+}
+
 impl SetupScan {
+    /// Take library class `index`'s hits now, from trees whose print is
+    /// `print`: the library pass calls this right after typing a class,
+    /// while its bodies are still on the heap, so the next round's scan
+    /// keeps them instead of reading the bodies back from the store.
+    pub(super) fn record(
+        &mut self,
+        index: usize,
+        classes: usize,
+        lc: &LibraryClass,
+        print: u64,
+        mailers: &HashSet<ClassId>,
+        targets: &HashSet<&ClassId>,
+    ) {
+        if self.library.len() != classes {
+            self.library = (0..classes).map(|_| None).collect();
+        }
+        let slot = &mut self.library[index];
+        if slot.as_ref().is_some_and(|hits| hits.name == lc.name && hits.print == Some(print)) {
+            return;
+        }
+        *slot = Some(library_hits(lc, Some(print), mailers, targets));
+    }
+
     /// Both scans, reusing the hits of each library class whose trees
     /// print `prints[i]` is the one they were taken at (`None`: walk).
     pub(super) fn scan(
@@ -243,15 +285,7 @@ impl SetupScan {
                 continue;
             }
             walked += 1;
-            let mut mailer = Vec::new();
-            for method in &lc.methods {
-                method.body.with_expr(|body| mailer_hits(body, mailers, &mut mailer));
-            }
-            let mut writes = Vec::new();
-            if !targets.is_empty() {
-                library_hook_bodies(lc, &mut |body| attr_hits(body, targets, &mut writes));
-            }
-            *slot = Some(LibraryHits { name: lc.name.clone(), print: *print, mailer, writes });
+            *slot = Some(library_hits(lc, *print, mailers, targets));
         }
 
         let mut mailer_hits_all = Vec::new();

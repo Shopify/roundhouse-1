@@ -4902,6 +4902,7 @@ impl Analyzer {
             .collect();
         drop(library_modules);
         let app_library_len = app.library_classes.len();
+        let attribute_targets: crate::det::HashSet<&ClassId> = app.current_attribute_classes.iter().collect();
         for (index, lc) in app.library_classes.iter_mut().enumerate() {
             if let Some(row) = mailer_with_params.get(&lc.name) {
                 let created = !self.classes.contains_key(&lc.name);
@@ -5172,6 +5173,10 @@ impl Analyzer {
                     }
                     let flags = lc.methods.iter().map(|method| block_value_candidate(&method.body)).collect();
                     self.block_value_candidates[index] = Some((lc_name.clone(), trees_after, flags));
+                    // So do the next setup's tree scans and the next unify's
+                    // call-site collection.
+                    self.setup_scan.record(index, app_library_len, lc, trees_after, &mailer_names, &attribute_targets);
+                    self.collect_typed_library_sites(index, app_library_len, lc, trees_after, app.models.len(), &app.helper_method_index);
                 }
                 for method in &mut lc.methods {
                     method.body.spill(&store);
@@ -7661,6 +7666,30 @@ impl Analyzer {
         helpers: &HashMap<Symbol, ClassId>,
         out: &mut Vec<ParamSite>,
     ) {
+        self.collect_send_sites_reading(expr, self_class, side, helpers, out, &mut Vec::new());
+    }
+
+    /// Whether `class` defines `method` as an instance method and not as
+    /// a class method: the registry read behind dropping an `x.class`
+    /// site in [`Self::collect_send_sites`].
+    fn defines_only_on_instances(&self, class: &ClassId, method: &Symbol) -> bool {
+        self.classes
+            .get(class)
+            .is_some_and(|k| k.instance_methods.contains_key(method) && !k.class_methods.contains_key(method))
+    }
+
+    /// [`Self::collect_send_sites`], noting in `reads` each registry read
+    /// it made (`defines_only_on_instances`) and its answer, so sites
+    /// collected earlier can be checked against the registry as it is now.
+    fn collect_send_sites_reading(
+        &self,
+        expr: &Expr,
+        self_class: Option<&ClassId>,
+        side: MethodReceiver,
+        helpers: &HashMap<Symbol, ClassId>,
+        out: &mut Vec<ParamSite>,
+        reads: &mut Vec<(ClassId, Symbol, bool)>,
+    ) {
         match &*expr.node {
             ExprNode::Send { recv, method, args, block, .. } => {
                 // Resolve the receiver class: an explicit receiver
@@ -7714,9 +7743,9 @@ impl Analyzer {
                 });
                 if via_dot_class {
                     recv_classes.retain(|c| {
-                        !self.classes.get(c).is_some_and(|k| {
-                            k.instance_methods.contains_key(method) && !k.class_methods.contains_key(method)
-                        })
+                        let instance_only = self.defines_only_on_instances(c, method);
+                        reads.push((c.clone(), method.clone(), instance_only));
+                        !instance_only
                     });
                 }
                 if !recv_classes.is_empty() {
@@ -7866,129 +7895,129 @@ impl Analyzer {
                         out.push((class_id, method.clone(), site_side, arg_tys.clone(), kw_tys.clone()));
                     }
                 }
-                if let Some(r) = recv { self.collect_send_sites(r, self_class, side, helpers, out); }
-                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
+                if let Some(r) = recv { self.collect_send_sites_reading(r, self_class, side, helpers, out, reads); }
+                for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
+                if let Some(b) = block { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
             }
             ExprNode::Seq { exprs } | ExprNode::Array { elements: exprs, .. } => {
-                for e in exprs { self.collect_send_sites(e, self_class, side, helpers, out); }
+                for e in exprs { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
-                    self.collect_send_sites(k, self_class, side, helpers, out);
-                    self.collect_send_sites(v, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(k, self_class, side, helpers, out, reads);
+                    self.collect_send_sites_reading(v, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::ForwardKeywordsWithPairs { entries } => {
                 for (key, value) in entries {
-                    self.collect_send_sites(key, self_class, side, helpers, out);
-                    self.collect_send_sites(value, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(key, self_class, side, helpers, out, reads);
+                    self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::If { cond, then_branch, else_branch } => {
-                self.collect_send_sites(cond, self_class, side, helpers, out);
-                self.collect_send_sites(then_branch, self_class, side, helpers, out);
-                self.collect_send_sites(else_branch, self_class, side, helpers, out);
+                self.collect_send_sites_reading(cond, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(then_branch, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(else_branch, self_class, side, helpers, out, reads);
             }
             ExprNode::Case { scrutinee, arms } => {
-                self.collect_send_sites(scrutinee, self_class, side, helpers, out);
+                self.collect_send_sites_reading(scrutinee, self_class, side, helpers, out, reads);
                 for arm in arms {
-                    if let Some(g) = &arm.guard { self.collect_send_sites(g, self_class, side, helpers, out); }
-                    self.collect_send_sites(&arm.body, self_class, side, helpers, out);
+                    if let Some(g) = &arm.guard { self.collect_send_sites_reading(g, self_class, side, helpers, out, reads); }
+                    self.collect_send_sites_reading(&arm.body, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::CaseMatch { scrutinee, arms, else_body } => {
-                self.collect_send_sites(scrutinee, self_class, side, helpers, out);
+                self.collect_send_sites_reading(scrutinee, self_class, side, helpers, out, reads);
                 for arm in arms {
-                    arm.pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, side, helpers, out));
-                    if let Some((_, g)) = &arm.guard { self.collect_send_sites(g, self_class, side, helpers, out); }
-                    self.collect_send_sites(&arm.body, self_class, side, helpers, out);
+                    arm.pattern.for_each_expr(&mut |e| self.collect_send_sites_reading(e, self_class, side, helpers, out, reads));
+                    if let Some((_, g)) = &arm.guard { self.collect_send_sites_reading(g, self_class, side, helpers, out, reads); }
+                    self.collect_send_sites_reading(&arm.body, self_class, side, helpers, out, reads);
                 }
-                if let Some(e) = else_body { self.collect_send_sites(e, self_class, side, helpers, out); }
+                if let Some(e) = else_body { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
             ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
-                self.collect_send_sites(value, self_class, side, helpers, out);
-                pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, side, helpers, out));
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
+                pattern.for_each_expr(&mut |e| self.collect_send_sites_reading(e, self_class, side, helpers, out, reads));
             }
             ExprNode::BoolOp { left, right, .. }
             | ExprNode::RescueModifier { expr: left, fallback: right } => {
-                self.collect_send_sites(left, self_class, side, helpers, out);
-                self.collect_send_sites(right, self_class, side, helpers, out);
+                self.collect_send_sites_reading(left, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(right, self_class, side, helpers, out, reads);
             }
             ExprNode::Let { value, body, .. } => {
-                self.collect_send_sites(value, self_class, side, helpers, out);
-                self.collect_send_sites(body, self_class, side, helpers, out);
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(body, self_class, side, helpers, out, reads);
             }
-            ExprNode::Lambda { body, .. } => self.collect_send_sites(body, self_class, side, helpers, out),
+            ExprNode::Lambda { body, .. } => self.collect_send_sites_reading(body, self_class, side, helpers, out, reads),
             // A `def` in a block defines on another class (`Class.new`'s):
             // its implicit-self calls are not this class's sites.
             ExprNode::MethodDefExpr { .. } => {}
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
-                    self.collect_send_sites(r, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(r, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::Apply { fun, args, block } => {
-                self.collect_send_sites(fun, self_class, side, helpers, out);
-                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
+                self.collect_send_sites_reading(fun, self_class, side, helpers, out, reads);
+                for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
+                if let Some(b) = block { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
             }
             ExprNode::Assign { target, value }
             | ExprNode::OpAssign { target, value, .. } => {
-                self.collect_send_sites(value, self_class, side, helpers, out);
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
                 if let LValue::Attr { recv, .. } = target {
-                    self.collect_send_sites(recv, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(recv, self_class, side, helpers, out, reads);
                 }
                 if let LValue::Index { recv, index } = target {
-                    self.collect_send_sites(recv, self_class, side, helpers, out);
-                    self.collect_send_sites(index, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(recv, self_class, side, helpers, out, reads);
+                    self.collect_send_sites_reading(index, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::StringInterp { parts } => {
                 for p in parts {
                     if let crate::expr::InterpPart::Expr { expr } = p {
-                        self.collect_send_sites(expr, self_class, side, helpers, out);
+                        self.collect_send_sites_reading(expr, self_class, side, helpers, out, reads);
                     }
                 }
             }
             ExprNode::Yield { args } => {
-                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
+                for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
             }
-            ExprNode::Raise { value } => self.collect_send_sites(value, self_class, side, helpers, out),
-            ExprNode::Return { value } => self.collect_send_sites(value, self_class, side, helpers, out),
+            ExprNode::Raise { value } => self.collect_send_sites_reading(value, self_class, side, helpers, out, reads),
+            ExprNode::Return { value } => self.collect_send_sites_reading(value, self_class, side, helpers, out, reads),
             ExprNode::Super { args, block } => {
                 if let Some(args) = args {
-                    for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
+                    for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
                 }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
+                if let Some(b) = block { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
             }
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-                self.collect_send_sites(body, self_class, side, helpers, out);
+                self.collect_send_sites_reading(body, self_class, side, helpers, out, reads);
                 for rc in rescues {
-                    for c in &rc.classes { self.collect_send_sites(c, self_class, side, helpers, out); }
-                    self.collect_send_sites(&rc.body, self_class, side, helpers, out);
+                    for c in &rc.classes { self.collect_send_sites_reading(c, self_class, side, helpers, out, reads); }
+                    self.collect_send_sites_reading(&rc.body, self_class, side, helpers, out, reads);
                 }
-                if let Some(e) = else_branch { self.collect_send_sites(e, self_class, side, helpers, out); }
-                if let Some(e) = ensure { self.collect_send_sites(e, self_class, side, helpers, out); }
+                if let Some(e) = else_branch { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
+                if let Some(e) = ensure { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
             ExprNode::Next { value } | ExprNode::Break { value } => {
-                if let Some(v) = value { self.collect_send_sites(v, self_class, side, helpers, out); }
+                if let Some(v) = value { self.collect_send_sites_reading(v, self_class, side, helpers, out, reads); }
             }
             ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
-                self.collect_send_sites(value, self_class, side, helpers, out)
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads)
             }
             ExprNode::MultiAssign { value, .. } => {
-                self.collect_send_sites(value, self_class, side, helpers, out)
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads)
             }
             ExprNode::While { cond, body, .. } => {
-                self.collect_send_sites(cond, self_class, side, helpers, out);
-                self.collect_send_sites(body, self_class, side, helpers, out);
+                self.collect_send_sites_reading(cond, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(body, self_class, side, helpers, out, reads);
             }
             ExprNode::Range { begin, end, .. } => {
-                if let Some(b) = begin { self.collect_send_sites(b, self_class, side, helpers, out); }
-                if let Some(e) = end { self.collect_send_sites(e, self_class, side, helpers, out); }
+                if let Some(b) = begin { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
+                if let Some(e) = end { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
-            ExprNode::Cast { value, .. } => self.collect_send_sites(value, self_class, side, helpers, out),
+            ExprNode::Cast { value, .. } => self.collect_send_sites_reading(value, self_class, side, helpers, out, reads),
             ExprNode::Lit { .. }
             | ExprNode::Var { .. }
             | ExprNode::Ivar { .. }

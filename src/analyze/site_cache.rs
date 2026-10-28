@@ -19,6 +19,13 @@
 //! registry's class set and each class's parent and includes; the
 //! cache starts over when those differ from the round it was built in.
 //!
+//! With the unit store (`ROUNDHOUSE_STORE`), the library pass collects a
+//! class's sites right after typing it, while its bodies are on the heap,
+//! under the trees print it records. The next unify places those sites
+//! instead of reading the bodies back from the store to collect them
+//! again, and drops them; placement still runs at unify time, against
+//! the registry as it is then.
+//!
 //! `ROUNDHOUSE_INCREMENTAL=0` uses the full rebuild every round;
 //! `ROUNDHOUSE_INCREMENTAL=check` also runs the full rebuild and fails
 //! the analysis if the tables differ.
@@ -29,7 +36,7 @@ use crate::det::HashMap;
 
 use super::{bound_param_row, incremental, observe_into, Analyzer, ParamSite, ParamTables, UnifyScope};
 use crate::app::ParamKey;
-use crate::dialect::MethodReceiver;
+use crate::dialect::{LibraryClass, MethodReceiver};
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 use crate::App;
@@ -55,6 +62,18 @@ struct Source {
     callers: Vec<(ClassId, Symbol)>,
 }
 
+/// A library class's call sites as collected right after the library
+/// pass typed it, from trees whose print is `print`. Not yet placed:
+/// placement reads the registry as the next unify finds it.
+struct Collected {
+    name: ClassId,
+    print: u64,
+    raw: Vec<ParamSite>,
+    /// The registry reads the collection made, with their answers; the
+    /// sites stand only while each read still answers the same.
+    reads: Vec<(ClassId, Symbol, bool)>,
+}
+
 #[derive(Default)]
 pub(super) struct SiteCache {
     sources: Vec<Source>,
@@ -64,6 +83,10 @@ pub(super) struct SiteCache {
     contributors: HashMap<ParamKey, Vec<u32>>,
     /// [`placement_print`] of the registry the sites were placed against.
     placement: Option<(usize, u64)>,
+    /// Per library class, the sites [`Analyzer::collect_typed_library_sites`]
+    /// took since the last unify; that unify uses them in place of a walk
+    /// of the class's (stored) bodies, then drops them all.
+    collected: Vec<Option<Collected>>,
 }
 
 /// What site placement (`inherited_param_owner`, `lexical_parent`) reads
@@ -138,6 +161,49 @@ fn run<'s>(sites: &'s [(ParamKey, Vec<Ty>)], key: &ParamKey) -> &'s [(ParamKey, 
 }
 
 impl Analyzer {
+    /// A library class's call sites, as the full walk collects them.
+    fn collect_library_sites(
+        &self,
+        lc: &LibraryClass,
+        helpers: &HashMap<Symbol, ClassId>,
+        out: &mut Vec<ParamSite>,
+        reads: &mut Vec<(ClassId, Symbol, bool)>,
+    ) {
+        for method in &lc.methods {
+            method.body.with_expr(|body| self.collect_send_sites_reading(body, Some(&lc.name), method.receiver, helpers, out, reads));
+        }
+    }
+
+    /// Collect library class `index`'s call sites now, from trees whose
+    /// print is `print`. The library pass calls this right after typing
+    /// a class, while its bodies are still on the heap, so the next unify
+    /// does not read them back from the store to collect the same sites.
+    pub(super) fn collect_typed_library_sites(
+        &mut self,
+        index: usize,
+        classes: usize,
+        lc: &LibraryClass,
+        print: u64,
+        models: usize,
+        helpers: &HashMap<Symbol, ClassId>,
+    ) {
+        // Sites the cache already holds for these trees are not walked
+        // by the unify, so they are not collected again.
+        let held = self.site_cache.sources.get(models + index).is_some_and(|source| {
+            matches!(&source.unit, Unit::Library(i, name) if *i == index && *name == lc.name) && source.print == Some(print)
+        });
+        if held {
+            return;
+        }
+        let (mut raw, mut reads) = (Vec::new(), Vec::new());
+        self.collect_library_sites(lc, helpers, &mut raw, &mut reads);
+        let collected = &mut self.site_cache.collected;
+        if collected.len() != classes {
+            *collected = (0..classes).map(|_| None).collect();
+        }
+        collected[index] = Some(Collected { name: lc.name.clone(), print, raw, reads });
+    }
+
     /// Collect one unit's call sites, as the full walk does.
     fn collect_unit_sites(&self, app: &App, unit: &Unit, scope: UnifyScope, out: &mut Vec<ParamSite>) {
         let helpers = &app.helper_method_index;
@@ -163,12 +229,7 @@ impl Analyzer {
                     }
                 }
             }
-            Unit::Library(i, _) => {
-                let lc = &app.library_classes[*i];
-                for method in &lc.methods {
-                    method.body.with_expr(|body| self.collect_send_sites(body, Some(&lc.name), method.receiver, helpers, out));
-                }
-            }
+            Unit::Library(i, _) => self.collect_library_sites(&app.library_classes[*i], helpers, out, &mut Vec::new()),
             Unit::Controller(i, _) => {
                 let controller = &app.controllers[*i];
                 for action in controller.actions() {
@@ -227,6 +288,16 @@ impl Analyzer {
     /// `scope` builds.
     pub(super) fn apply_param_sites_incrementally(&mut self, app: &App, scope: UnifyScope, tables: &ParamTables) {
         let mut cache = std::mem::take(&mut self.site_cache);
+        let mut collected = std::mem::take(&mut cache.collected);
+        #[cfg(feature = "memory-census")]
+        if crate::memory_census::enabled() {
+            let (classes, sites) = collected.iter().flatten().fold((0usize, 0usize), |(c, s), k| (c + 1, s + k.raw.len()));
+            let bytes = crate::memory_census::live_delta(|| collected.iter().flatten().map(|k| k.raw.clone()).collect::<Vec<_>>());
+            crate::memory_census::note(
+                "unify",
+                format_args!("call sites collected at typing: {classes} library classes, {sites} sites, {:.1}MB", bytes as f64 / 1e6),
+            );
+        }
         let units = units(app);
         let placement = Some(placement_print(&self.classes));
         let restart = cache.placement != placement
@@ -242,7 +313,7 @@ impl Analyzer {
         let collect = crate::timings::begin("unify: collect");
         let mut placed = HashMap::default();
         let mut affected: BTreeSet<ParamKey> = BTreeSet::new();
-        let (mut walked, mut changed) = (0usize, 0usize);
+        let (mut walked, mut reused, mut stale, mut changed) = (0usize, 0usize, 0usize, 0usize);
         for (index, source) in cache.sources.iter_mut().enumerate() {
             let print = match &source.unit {
                 Unit::Library(i, name) => self.incremental.trees_of(*i, name),
@@ -251,9 +322,29 @@ impl Analyzer {
             if print.is_some() && source.print == print {
                 continue;
             }
-            walked += 1;
-            let mut raw = Vec::new();
-            self.collect_unit_sites(app, &source.unit, scope, &mut raw);
+            let taken = match (&source.unit, print) {
+                (Unit::Library(i, name), Some(print)) => {
+                    collected.get_mut(*i).and_then(Option::take).filter(|sites| sites.name == *name && sites.print == print)
+                }
+                _ => None,
+            };
+            let taken = taken.and_then(|sites| {
+                let current = sites.reads.iter().all(|(class, method, answer)| self.defines_only_on_instances(class, method) == *answer);
+                stale += usize::from(!current);
+                current.then_some(sites.raw)
+            });
+            let raw = match taken {
+                Some(raw) => {
+                    reused += 1;
+                    raw
+                }
+                None => {
+                    walked += 1;
+                    let mut raw = Vec::new();
+                    self.collect_unit_sites(app, &source.unit, scope, &mut raw);
+                    raw
+                }
+            };
             source.callers = unit_class(&source.unit).map(|caller| call_targets(caller, &raw)).unwrap_or_default();
             let mut sites = self.place_param_sites(raw, &tables.shapes, &tables.defined, &mut placed);
             sites.sort_by(|a, b| a.0.cmp(&b.0));
@@ -288,6 +379,7 @@ impl Analyzer {
             }
         }
         drop(collect);
+        drop(collected);
         for source in &cache.sources {
             if let Some(caller) = unit_class(&source.unit) {
                 self.record_callers(caller, &source.callers);
@@ -318,7 +410,7 @@ impl Analyzer {
             }
         }
         crate::timings::note(format_args!(
-            "unify sites: walked {walked} of {} sources, {changed} changed, {} keys refolded, restarted {restart}",
+            "unify sites: walked {walked} of {} sources ({stale} collected at typing but stale), {reused} collected at typing, {changed} changed, {} keys refolded, restarted {restart}",
             cache.sources.len(),
             affected.len()
         ));
