@@ -21,16 +21,19 @@
 //! the pass order, so no later pass ledgers residue for a body that is
 //! not going to emit.
 //!
-//! Except a railtie or engine on a PostgreSQL app: the only tree that
-//! emits one is the CRuby tree (`project::target_files` refuses every
-//! other target for PostgreSQL), and that tree ports `Rails::Railtie`
+//! Except a railtie or engine: the CRuby tree ports `Rails::Railtie`
 //! and `Rails::Engine` (runtime/rails_railtie.rb, rails_engine.rb), so
 //! the class is carried, its body replayed, and boot runs its
-//! initializers (`App::railties`). Likewise an Active Job argument
-//! serializer (`ActiveJob::Serializers::ObjectSerializer`): the CRuby
-//! tree ports the registry (runtime/active_job_callbacks.rb), and Core's
-//! MoneyBagJobArgumentSerializer and shopify-money's railtie register
-//! theirs there.
+//! initializers (`App::railties`). This pass is target-neutral, so the
+//! class is kept here and every other target drops it at emit, out loud
+//! (`project::without_carried_railties`, through
+//! [`apply_railtie_subclass_drop`]). Likewise an Active Job argument
+//! serializer (`ActiveJob::Serializers::ObjectSerializer`) on a
+//! PostgreSQL app, whose only emitted tree is the CRuby tree
+//! (`project::target_files` refuses every other target for PostgreSQL):
+//! that tree ports the registry (runtime/active_job_callbacks.rb), and
+//! Core's MoneyBagJobArgumentSerializer and shopify-money's railtie
+//! register theirs there.
 
 use crate::det::HashMap;
 
@@ -41,18 +44,31 @@ use crate::ingest::library_class::is_unported_rails_base;
 use crate::span::Span;
 
 pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
+    let postgresql = app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
+    drop_subclasses_of(app, |base| {
+        is_unported_rails_base(base)
+            && !crate::ingest::library_class::is_railtie_base(base)
+            && !(postgresql && base == "ActiveJob::Serializers::ObjectSerializer")
+    })
+}
+
+/// Drop the app's railties and engines, with their subclasses, for a
+/// target that does not port `Rails::Railtie` and `Rails::Engine` (every
+/// one but the CRuby tree), with the same residue line as an unported
+/// base. Called at emit, after [`apply_unported_rails_subclass_drop`]
+/// has kept them.
+pub fn apply_railtie_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
+    let diags = drop_subclasses_of(app, crate::ingest::library_class::is_railtie_base);
+    let kept: crate::det::HashSet<Symbol> = app.library_classes.iter().map(|lc| lc.name.0.clone()).collect();
+    app.railties.retain(|railtie| kept.contains(&railtie.name.0));
+    diags
+}
+
+fn drop_subclasses_of(app: &mut App, unported: impl Fn(&str) -> bool) -> Vec<Diagnostic> {
     // Each doomed class → the base at the top of its chain. A fixpoint
     // because `library_classes` is in file order, and a subclass's file
     // can sort before its parent's.
     let mut doomed: HashMap<Symbol, Symbol> = HashMap::default();
-    let carries_railties =
-        app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
-    let unported = |base: &str| {
-        is_unported_rails_base(base)
-            && !(carries_railties
-                && (crate::ingest::library_class::is_railtie_base(base)
-                    || base == "ActiveJob::Serializers::ObjectSerializer"))
-    };
     loop {
         let mut grew = false;
         for lc in &app.library_classes {

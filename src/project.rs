@@ -1582,17 +1582,20 @@ fn apply_file_load_hooks(files: &mut Vec<(String, String)>, app: &App) -> Result
 /// does: the `:boot` phase before eager loading, the `:finish` phase
 /// (Finisher's, which eager loads) at the end of boot.rb.
 ///
-/// Rails::Engine stays the PostgreSQL tree's: the app's own engines are
-/// dropped on every other tree (`lower::unported_rails_subclasses`), and
-/// `require "rails/engine"` is refused by name.
+/// Rails::Engine loads with it: the app's own railties and engines are
+/// carried compiled (`App::railties`), and app/models.rb loads them at
+/// boot in Rails' order, so an engine's class body, `root` and
+/// initializers run as on the PostgreSQL tree (runtime/rails_engine.rb).
+/// Before, the tree dropped them, and a file nested in one (`class
+/// Engine::Inflector` reading `Engine.root`) loaded against a bare module.
 fn apply_native_gem_boundary(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
     let native_gems = !bundler_required_runtime_gems(&app.bundler_gems, app.gem_lock.as_ref(), &app.extensions).is_empty()
         || !lock_gated_requires(app).is_empty()
         || !gem_source_entries(app).is_empty();
-    if !native_gems {
+    if !native_gems && app.railties.is_empty() {
         return Ok(());
     }
-    for port in ["active_support_lazy_load_hooks", "active_support_ordered_options", "rails_railtie"] {
+    for port in ["active_support_lazy_load_hooks", "active_support_ordered_options", "rails_railtie", "rails_engine"] {
         let path = format!("runtime/{port}.rb");
         if !files.iter().any(|(p, _)| *p == path) {
             let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
@@ -1603,10 +1606,19 @@ fn apply_native_gem_boundary(files: &mut Vec<(String, String)>, app: &App) -> Re
     files.push((
         "runtime/features/rails.rb".into(),
         "# `require \"rails\"` on this tree: railties' Rails, the runtime ports\n\
-         # (runtime/rails.rb, loaded by boot.rb) with Rails::Railtie\n\
-         # (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this directory\n\
-         # first on the load path.\n\
-         require_relative \"../rails_railtie\"\n"
+         # (runtime/rails.rb, loaded by boot.rb) with Rails::Railtie and\n\
+         # Rails::Engine (runtime/rails_railtie.rb, rails_engine.rb).\n\
+         # runtime/gem_facades.rb puts this directory first on the load path.\n\
+         require_relative \"../rails_railtie\"\n\
+         require_relative \"../rails_engine\"\n"
+            .into(),
+    ));
+    files.push((
+        "runtime/features/rails/engine.rb".into(),
+        "# `require \"rails/engine\"` on this tree: railties' Rails::Engine,\n\
+         # ported (runtime/rails_engine.rb). runtime/gem_facades.rb puts this\n\
+         # directory first on the load path.\n\
+         require_relative \"../../rails_engine\"\n"
             .into(),
     ));
     files.push((
@@ -1628,9 +1640,11 @@ fn apply_native_gem_boundary(files: &mut Vec<(String, String)>, app: &App) -> Re
         + configuration.len();
     facades.insert_str(
         at,
-        "# Rails::Railtie, which `require \"rails\"` defines before Bundler.require:\n\
-         # a gem's railtie subclasses it as the gem loads.\n\
-         require_relative \"rails_railtie\"\n",
+        "# Rails::Railtie and Rails::Engine, which `require \"rails\"` defines\n\
+         # before Bundler.require: for the gems' railties and the app's own\n\
+         # railties and engines, which app/models.rb loads.\n\
+         require_relative \"rails_railtie\"\n\
+         require_relative \"rails_engine\"\n",
     );
     facades.insert_str(
         0,
@@ -1648,9 +1662,9 @@ fn apply_native_gem_boundary(files: &mut Vec<(String, String)>, app: &App) -> Re
     let at = models.rfind(eager).ok_or("native gem boundary: missing eager load in app/models.rb")?;
     models.replace_range(
         at..at + eager.len(),
-        "# Application#initialize!: the railties' initializers, in Rails' order\n\
-         # (runtime/rails_railtie.rb). Finisher's part, which eager loads\n\
-         # (`config.eager_load`), runs at the end of boot.rb.\n\
+        "# Application#initialize!: the railties' and engines' initializers, in\n\
+         # Rails' order (runtime/rails_railtie.rb). Finisher's part, which\n\
+         # eager loads (`config.eager_load`), runs at the end of boot.rb.\n\
          Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)\n",
     );
     let (_, boot) = files
@@ -1917,6 +1931,26 @@ fn without_rails_health_controller(app: &App, target: BuildTarget) -> Option<App
     emit::diagnostics::push(d);
     let mut app = app.clone();
     app.controllers.retain(|c| c.name.0.as_str() != health);
+    Some(app)
+}
+
+/// The app as a target that does not port `Rails::Railtie` and
+/// `Rails::Engine` sees it: its railties and engines dropped, with their
+/// subclasses, each named (`lower::unported_rails_subclasses`). Only the
+/// CRuby tree ports them (runtime/rails_railtie.rb, rails_engine.rb).
+/// `None` when there is nothing to drop.
+fn without_carried_railties(app: &App, target: BuildTarget) -> Option<App> {
+    if target == BuildTarget::Ruby
+        || !app.library_classes.iter().any(|lc| {
+            lc.parent.as_ref().is_some_and(|parent| crate::ingest::library_class::is_railtie_base(parent.0.as_str()))
+        })
+    {
+        return None;
+    }
+    let mut app = app.clone();
+    for d in crate::lower::unported_rails_subclasses::apply_railtie_subclass_drop(&mut app) {
+        emit::diagnostics::push(d);
+    }
     Some(app)
 }
 
@@ -2582,6 +2616,14 @@ fn target_files_inner(
         Some(trimmed) => {
             without_aliases = trimmed;
             &without_aliases
+        }
+        None => app,
+    };
+    let without_railties;
+    let app = match without_carried_railties(app, target) {
+        Some(trimmed) => {
+            without_railties = trimmed;
+            &without_railties
         }
         None => app,
     };
