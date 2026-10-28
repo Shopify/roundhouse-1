@@ -1473,10 +1473,12 @@ pub(crate) fn for_each_hook_body_ref(
             f(default);
         }
     }
+    // Library bodies may be in the unit store: each is decoded for the
+    // visit and not kept, so the walk holds one at a time.
     for lc in &app.library_classes {
         for method in &lc.methods {
             visit_param_defaults(&method.params, f);
-            f(&method.body);
+            method.body.with_expr(|body| f(body));
         }
         for (_name, value) in &lc.constants {
             f(value);
@@ -1492,7 +1494,7 @@ pub(crate) fn for_each_hook_body_ref(
     if let Some(lc) = &app.rails_application {
         for method in &lc.methods {
             visit_param_defaults(&method.params, f);
-            f(&method.body);
+            method.body.with_expr(|body| f(body));
         }
         for (_name, value) in &lc.constants {
             f(value);
