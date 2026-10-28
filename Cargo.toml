@@ -24,7 +24,9 @@ x86_64-pc-windows-msvc = ["roundhouse"]
 
 [dependencies]
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+# `float_roundtrip`: the unit store (`src/store.rs`) writes method bodies as
+# JSON and reads them back, and a float literal must decode to the same bits.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml_ng = "0.10"
 indexmap = { version = "2", features = ["serde"] }
 # The deterministic hasher behind `det::HashMap` (src/det.rs).
