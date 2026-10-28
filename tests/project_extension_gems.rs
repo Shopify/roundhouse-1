@@ -123,6 +123,11 @@ fn rbi_refusal_covers_inheritance_but_not_an_app_owned_namesake() {
 const TELEMETRY_LOCK: &str = "GEM\n  specs:\n    opentelemetry-api (1.0)\n\nDEPENDENCIES\n  opentelemetry-api\n";
 const TELEMETRY_RBI: &str = "module TelemetryProbe\n  sig { returns(String) }\n  def self.label; end\nend\n";
 const TELEMETRY_RBI_PATH: &str = "sorbet/rbi/gems/opentelemetry-api@1.0.rbi";
+/// An infrastructure gem no tree loads on its own: opentelemetry-api's RBI
+/// is selected for every app whose lock pins it, because the Ruby-family
+/// trees require it (`project::lock_loaded_gems`).
+const PROBE_LOCK: &str = "GEM\n  specs:\n    dotenv (1.0)\n\nDEPENDENCIES\n  dotenv\n";
+const PROBE_RBI_PATH: &str = "sorbet/rbi/gems/dotenv@1.0.rbi";
 
 #[test]
 fn extension_facts_select_infrastructure_rbis_without_leaking_to_another_app() {
@@ -131,8 +136,8 @@ fn extension_facts_select_infrastructure_rbis_without_leaking_to_another_app() {
         let files = [
             ("roundhouse.yml", "extensions: [config/rh]\n"),
             ("config/rh/gems.yml", extension),
-            ("Gemfile.lock", TELEMETRY_LOCK),
-            (TELEMETRY_RBI_PATH, TELEMETRY_RBI),
+            ("Gemfile.lock", PROBE_LOCK),
+            (PROBE_RBI_PATH, TELEMETRY_RBI),
             ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
             ("app/controllers/report_controller.rb", source),
             ("config/routes.rb", "Rails.application.routes.draw { get '/report', to: 'report#show' }\n"),
@@ -142,7 +147,7 @@ fn extension_facts_select_infrastructure_rbis_without_leaking_to_another_app() {
         Analyzer::new(&app).analyze(&mut app);
         app
     };
-    let extended = build("runtime_gems:\n  - {constant: TelemetryProbe, gem: opentelemetry-api}\n");
+    let extended = build("runtime_gems:\n  - {constant: TelemetryProbe, gem: dotenv}\n");
     let bare = build("{}\n");
     let typed = diagnose(&extended);
     assert!(typed.iter().any(|diagnostic| matches!(&diagnostic.kind,
