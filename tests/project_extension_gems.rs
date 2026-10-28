@@ -361,3 +361,21 @@ fn an_rbi_patch_does_not_own_a_framework_class() {
     assert!(!diagnose(&app).iter().any(|diagnostic| diagnostic.severity == Severity::Error));
     assert!(project::target_files(&app, Path::new("."), BuildTarget::Ruby).is_ok());
 }
+
+/// The refusal walk decides each constant path once and reuses the
+/// decision (a large app reads the same gem constant thousands of times),
+/// so every read is still named at its own site, and an app-owned
+/// namesake read beside them is still not refused.
+#[test]
+fn every_read_of_a_refused_constant_is_named_at_its_site() {
+    let source = "class Report\n  def self.one\n    WidgetEngine::Client.label\n  end\n\n  def self.two\n    WidgetEngine::Client.label\n  end\n\n  def self.mine\n    Report\n  end\nend\n";
+    let app = app(ENGINE_LOCK, REFUSED, None, source);
+    let starts: Vec<u32> = diagnose(&app)
+        .iter()
+        .filter(|diagnostic| matches!(&diagnostic.kind,
+            DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "gem_requires_rails"))
+        .map(|diagnostic| diagnostic.span.start)
+        .collect();
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert_ne!(starts[0], starts[1], "{starts:?}");
+}
