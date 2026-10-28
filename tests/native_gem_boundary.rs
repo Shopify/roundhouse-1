@@ -93,13 +93,15 @@ fn a_native_gem_loads_against_the_runtime_s_active_record_and_railtie() {
          puts Trackish.configured_by\n\
          puts Trackish.after_initialize_ran.inspect\n\
          puts $LOADED_FEATURES.grep(%r{/(activerecord|railties)-}).empty?\n\
-         begin\n  require \"rails/engine\"\n  puts :engine_loaded\nrescue LoadError => e\n  puts e.message[/framework_feature_not_ported/]\nend\n",
+         require \"rails/engine\"\n\
+         puts Rails::Engine.superclass\n\
+         begin\n  require \"active_storage/engine\"\n  puts :active_storage_loaded\nrescue LoadError => e\n  puts e.message[/framework_feature_not_ported/]\nend\n",
         &[("GEM_PATH", &path), ("GEM_HOME", &home.display().to_string())],
     );
     run.assert_passes();
     assert_eq!(
         run.stdout,
-        "true\nRails::Railtie\nRails::Application\ntrue\ntrue\nframework_feature_not_ported\n",
+        "true\nRails::Railtie\nRails::Application\ntrue\ntrue\nRails::Railtie\nframework_feature_not_ported\n",
         "{}",
         run.stderr
     );
@@ -121,10 +123,9 @@ fn boot_runs_the_railties_initializers_around_the_app_s_code() {
     let finish = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)").unwrap_or_else(|| panic!("{boot}"));
     let loads = boot.find("require_relative \"app/models\"").expect("app/models");
     assert!(loads < finish, "{boot}");
-    for feature in ["rails", "rails/railtie", "active_record"] {
+    for feature in ["rails", "rails/railtie", "rails/engine", "active_record"] {
         assert!(dir.join(format!("runtime/features/{feature}.rb")).exists(), "runtime/features/{feature}.rb");
     }
-    assert!(!dir.join("runtime/features/rails/engine.rb").exists());
 }
 
 #[test]

@@ -173,12 +173,14 @@ fn a_gem_base_under_a_rails_namespace_is_kept() {
 }
 
 /// A gem's Railtie (opentelemetry-shopify 1.22.0's, app_profiler 0.6.0's,
-/// compiled as gem sources) is dropped the same way, and the line names
-/// each `initializer` that therefore does not run at boot, at the first
-/// one's site: the gem's configuration stays at its own defaults, and the
-/// ledger says so rather than implying the hook ran.
+/// compiled as gem sources) is kept by the target-neutral lowering: the
+/// CRuby tree ports Rails::Railtie and runs its initializers. A target
+/// that does not port it drops it at emit (`apply_railtie_subclass_drop`),
+/// and the line names each `initializer` that therefore does not run at
+/// boot, at the first one's site: the gem's configuration stays at its own
+/// defaults, and the ledger says so rather than implying the hook ran.
 #[test]
-fn a_railtie_is_dropped_and_its_initializers_are_named_as_not_run() {
+fn a_railtie_is_kept_for_the_cruby_tree_and_dropped_with_its_initializers_named_elsewhere() {
     let mut app = ingest(&[(
         "lib/tracing/railtie.rb",
         r#"module Tracing
@@ -196,6 +198,9 @@ end
     )]);
     assert_eq!(library_class_names(&app), vec!["Tracing::Railtie"]);
     let diags = roundhouse::session::analyze_and_lower(&mut app);
+    assert!(dropped(&app, &diags).is_empty(), "{:?}", dropped(&app, &diags));
+    assert_eq!(library_class_names(&app), vec!["Tracing::Railtie"]);
+    let diags = roundhouse::lower::unported_rails_subclasses::apply_railtie_subclass_drop(&mut app);
     assert!(library_class_names(&app).is_empty());
     let gaps = dropped(&app, &diags);
     assert_eq!(gaps.len(), 1, "{gaps:?}");
