@@ -16821,6 +16821,10 @@ pub(crate) fn gem_port_declaring(name: &str) -> Option<(&'static str, &'static s
 /// (`gem_source_dependency_block`), so a `GIT` gem in their closure is
 /// activated as a runtime gem's is: panama_client 3.2.3 requires
 /// grpc_fork_safety, which depends on Core's grpc fork.
+/// The gems runtime/active_support_mem_cache_store.rb requires when it
+/// loads.
+const MEM_CACHE_STORE_GEMS: [&str; 2] = ["dalli", "connection_pool"];
+
 fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App, gem_sources: &[String]) -> Result<(), String> {
     let lock = app.gem_lock.as_ref();
     let mut needed: Vec<&'a str> = Vec::new();
@@ -16840,6 +16844,17 @@ fn apply_runtime_gem_wiring<'a>(files: &mut Vec<(String, String)>, app: &'a App,
         // A gem the lock carries as source is compiled, not required.
         if demanded && !needed.contains(&gem) && !lock.is_some_and(|l| l.is_in_repo(gem)) {
             needed.push(gem);
+        }
+    }
+    // The MemCacheStore port requires dalli and connection_pool as it
+    // loads, as activesupport's mem_cache_store.rb does, so a tree that
+    // carries it (app code names the class) declares both. Without them
+    // boot stopped at the port's `require "dalli"` (LoadError).
+    if files.iter().any(|(p, _)| p == "runtime/active_support_mem_cache_store.rb") {
+        for gem in MEM_CACHE_STORE_GEMS.iter().copied() {
+            if !needed.contains(&gem) && !lock.is_some_and(|l| l.is_in_repo(gem)) {
+                needed.push(gem);
+            }
         }
     }
     // The lock-gated Bundler.require entries load whatever app/ names,
