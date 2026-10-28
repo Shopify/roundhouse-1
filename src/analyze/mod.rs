@@ -224,10 +224,11 @@ pub struct Analyzer {
     const_memo: ConstMemo,
     /// Per-library-class method body returns (`harvest_method_returns`).
     return_cache: Vec<Option<ReturnsAt>>,
-    /// Per library class, which methods' bodies could answer their block's
-    /// value, read from the trees print the flags were taken at
+    /// Per library class, what each method's body asks of the registry to
+    /// answer its block's value (`block_value_plan`; `None`: it cannot),
+    /// read from the trees print the plans were taken at
     /// (`harvest_block_value_methods`).
-    block_value_candidates: Vec<Option<(ClassId, u64, Vec<bool>)>>,
+    block_value_candidates: Vec<Option<(ClassId, u64, Vec<Option<BlockValueAsks>>)>>,
     /// Per-library-class hits of the library setup's tree scans.
     setup_scan: setup_scan::SetupScan,
     /// Library-class constant initializer typings across passes.
@@ -4902,6 +4903,7 @@ impl Analyzer {
             .collect();
         drop(library_modules);
         let app_library_len = app.library_classes.len();
+        let attribute_targets: crate::det::HashSet<&ClassId> = app.current_attribute_classes.iter().collect();
         for (index, lc) in app.library_classes.iter_mut().enumerate() {
             if let Some(row) = mailer_with_params.get(&lc.name) {
                 let created = !self.classes.contains_key(&lc.name);
@@ -5170,8 +5172,12 @@ impl Analyzer {
                     if self.block_value_candidates.len() != app_library_len {
                         self.block_value_candidates = (0..app_library_len).map(|_| None).collect();
                     }
-                    let flags = lc.methods.iter().map(|method| block_value_candidate(&method.body)).collect();
-                    self.block_value_candidates[index] = Some((lc_name.clone(), trees_after, flags));
+                    let plans = library_block_value_plans(&lc_name, &lc.methods);
+                    self.block_value_candidates[index] = Some((lc_name.clone(), trees_after, plans));
+                    // So do the next setup's tree scans and the next unify's
+                    // call-site collection.
+                    self.setup_scan.record(index, app_library_len, lc, trees_after, &mailer_names, &attribute_targets);
+                    self.collect_typed_library_sites(index, app_library_len, lc, trees_after, app.models.len(), &app.helper_method_index);
                 }
                 for method in &mut lc.methods {
                     method.body.spill(&store);
@@ -6240,10 +6246,10 @@ impl Analyzer {
                 }
             }
         }
-        // Whether a body could answer its block's value does not depend
-        // on the registry (`block_value_candidate`), so a library class
-        // whose trees are unchanged keeps its flags and only its
-        // candidates' bodies are read again.
+        // What a body asks of the registry to answer its block's value
+        // does not depend on the registry (`block_value_plan`), so a
+        // library class whose trees are unchanged keeps its plans and
+        // only the registry is asked again: no body is read.
         let mode = self.incremental.mode;
         let mut candidates = std::mem::take(&mut self.block_value_candidates);
         if candidates.len() != app.library_classes.len() {
@@ -6252,30 +6258,28 @@ impl Analyzer {
         for (index, lc) in app.library_classes.iter().enumerate() {
             let print = if mode == incremental::Mode::Off { None } else { self.incremental.trees_of(index, &lc.name) };
             let slot = &mut candidates[index];
-            let kept = slot.as_ref().filter(|(name, at, flags)| {
-                *name == lc.name && Some(*at) == print && flags.len() == lc.methods.len()
+            let kept = slot.as_ref().filter(|(name, at, plans)| {
+                *name == lc.name && Some(*at) == print && plans.len() == lc.methods.len()
             });
-            let flags: Vec<bool> = match kept {
-                Some((_, _, flags)) if mode == incremental::Mode::On => flags.clone(),
+            let fresh;
+            let plans: &[Option<BlockValueAsks>] = match kept {
+                Some((_, _, plans)) if mode == incremental::Mode::On => plans,
                 _ => {
-                    let flags: Vec<bool> = lc.methods.iter().map(|method| block_value_candidate(&method.body)).collect();
+                    let plans = library_block_value_plans(&lc.name, &lc.methods);
                     if let Some((_, _, old)) = kept {
                         assert!(
-                            *old == flags,
-                            "ROUNDHOUSE_INCREMENTAL=check: {} kept block-value candidates differ from its bodies'",
+                            *old == plans,
+                            "ROUNDHOUSE_INCREMENTAL=check: {} kept block-value plans differ from its bodies'",
                             lc.name.0.as_str()
                         );
                     }
-                    *slot = print.map(|at| (lc.name.clone(), at, flags.clone()));
-                    flags
+                    *slot = print.map(|at| (lc.name.clone(), at, plans.clone()));
+                    fresh = plans;
+                    &fresh
                 }
             };
-            for (method, candidate) in lc.methods.iter().zip(flags) {
-                if !candidate {
-                    continue;
-                }
-                let bp = method.block_param.as_ref().map(|p| &p.name);
-                if self.returns_block_value(&lc.name, &method.name, &method.body, bp) {
+            for (method, plan) in lc.methods.iter().zip(plans) {
+                if plan.as_ref().is_some_and(|asks| self.block_value_asks_hold(asks)) {
                     found.push((lc.name.clone(), method.name.clone()));
                 }
             }
@@ -6753,70 +6757,18 @@ impl Analyzer {
         body: &Expr,
         block_param: Option<&Symbol>,
     ) -> bool {
-        let leaves = return_leaves(body);
-        // Only campfire's explicit `RecordCache#fetch` contract answers
-        // its block's value, a local that only ever holds it, or — on a
-        // hit — the records a snapshot of that value rebuilds:
-        // `….map { |name, attrs| name.constantize.instantiate(attrs) }`
-        // (analysis sees the source; `lower::record_snapshot` later makes
-        // it `ActiveRecord::Base.instantiate_named`, accepted too). The rebuild is typed as the
-        // block's value on the claim that the snapshot under a key was
-        // taken from what this block returned for that key: the same
-        // records, in order, of the same classes. That is the contract the
-        // cache relies on in Rails too; a snapshot of anything else would
-        // be the app's bug under either runtime. This is a domain contract,
-        // not a fact recoverable from arbitrary serialized data: callers
-        // must not reuse a key for a different result shape. The
-        // cache-through contract test exercises miss/hit reconstruction,
-        // ordering, and distinct Article/Comment keys.
-        let yield_locals = yield_only_locals(body);
-        let record_cache_fetch = method.as_str() == "fetch"
-            && matches!(owner.0.as_str(), "RecordCache" | "Campfire::RecordCache");
-        let rebuild = |leaf: &Expr| {
-            record_cache_fetch &&
-            matches!(&*leaf.node, ExprNode::Send { method, block: Some(b), .. }
-                if method.as_str() == "map"
-                    && matches!(&*b.node, ExprNode::Lambda { body, .. }
-                        if return_leaves(body).iter().all(|l| snapshot_rebuild(l))))
-        };
-        // The rebuild is only ever the block's value AGAIN: some path must
-        // answer the block's value itself.
-        let direct = leaves.iter().any(|leaf| match &*leaf.node {
-            ExprNode::Yield { .. } => true,
-            ExprNode::Var { name, .. } => yield_locals.contains(name),
-            _ => false,
-        });
-        !leaves.is_empty()
-            && leaves.iter().all(|leaf| match &*leaf.node {
-                ExprNode::Yield { .. } => true,
-                ExprNode::Var { name, .. } => yield_locals.contains(name),
-                _ if direct && rebuild(leaf) => true,
-                ExprNode::Send { recv, method, block: Some(b), .. } => {
-                    let forwards = matches!(
-                        (&*b.node, block_param),
-                        (ExprNode::Var { name, .. }, Some(bp)) if name == bp
-                    );
-                    // The callee's own verdict, asked through the same
-                    // dispatch rule a call site uses, with a stand-in
-                    // informative block type.
-                    let recv_ty = match recv {
-                        Some(r) => r.ty.clone(),
-                        None => Some(Ty::Class { id: owner.clone(), args: vec![].into() }),
-                    };
-                    // `Rails.cache` by its spelling too: app analysis
-                    // does not type it (the runtime's RBS is not in the
-                    // app registry), and `fetch` on the framework's
-                    // store answers the block's value, fresh or cached.
-                    let rails_cache = method.as_str() == "fetch"
-                        && recv.as_ref().is_some_and(|r| crate::lower::rails_cache::is_rails_cache(r));
-                    forwards
-                        && (rails_cache
-                            || crate::analyze::body::BodyTyper::new(&self.classes)
-                                .block_value_return(recv_ty.as_ref(), method, Some(&Ty::Nil))
-                                .is_some())
-                }
-                _ => false,
-            })
+        block_value_plan(owner, method, body, block_param).is_some_and(|asks| self.block_value_asks_hold(&asks))
+    }
+
+    /// Whether every callee in `asks` returns its block's value: each
+    /// asked through the same dispatch rule a call site uses, with a
+    /// stand-in informative block type.
+    fn block_value_asks_hold(&self, asks: &BlockValueAsks) -> bool {
+        asks.iter().all(|(recv_ty, method)| {
+            crate::analyze::body::BodyTyper::new(&self.classes)
+                .block_value_return(recv_ty.as_ref(), method, Some(&Ty::Nil))
+                .is_some()
+        })
     }
 
     fn find_recursive_methods(app: &App) -> crate::det::HashSet<(ClassId, bool, Symbol)> {
@@ -7661,6 +7613,30 @@ impl Analyzer {
         helpers: &HashMap<Symbol, ClassId>,
         out: &mut Vec<ParamSite>,
     ) {
+        self.collect_send_sites_reading(expr, self_class, side, helpers, out, &mut Vec::new());
+    }
+
+    /// Whether `class` defines `method` as an instance method and not as
+    /// a class method: the registry read behind dropping an `x.class`
+    /// site in [`Self::collect_send_sites`].
+    fn defines_only_on_instances(&self, class: &ClassId, method: &Symbol) -> bool {
+        self.classes
+            .get(class)
+            .is_some_and(|k| k.instance_methods.contains_key(method) && !k.class_methods.contains_key(method))
+    }
+
+    /// [`Self::collect_send_sites`], noting in `reads` each registry read
+    /// it made (`defines_only_on_instances`) and its answer, so sites
+    /// collected earlier can be checked against the registry as it is now.
+    fn collect_send_sites_reading(
+        &self,
+        expr: &Expr,
+        self_class: Option<&ClassId>,
+        side: MethodReceiver,
+        helpers: &HashMap<Symbol, ClassId>,
+        out: &mut Vec<ParamSite>,
+        reads: &mut Vec<(ClassId, Symbol, bool)>,
+    ) {
         match &*expr.node {
             ExprNode::Send { recv, method, args, block, .. } => {
                 // Resolve the receiver class: an explicit receiver
@@ -7714,9 +7690,9 @@ impl Analyzer {
                 });
                 if via_dot_class {
                     recv_classes.retain(|c| {
-                        !self.classes.get(c).is_some_and(|k| {
-                            k.instance_methods.contains_key(method) && !k.class_methods.contains_key(method)
-                        })
+                        let instance_only = self.defines_only_on_instances(c, method);
+                        reads.push((c.clone(), method.clone(), instance_only));
+                        !instance_only
                     });
                 }
                 if !recv_classes.is_empty() {
@@ -7866,129 +7842,129 @@ impl Analyzer {
                         out.push((class_id, method.clone(), site_side, arg_tys.clone(), kw_tys.clone()));
                     }
                 }
-                if let Some(r) = recv { self.collect_send_sites(r, self_class, side, helpers, out); }
-                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
+                if let Some(r) = recv { self.collect_send_sites_reading(r, self_class, side, helpers, out, reads); }
+                for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
+                if let Some(b) = block { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
             }
             ExprNode::Seq { exprs } | ExprNode::Array { elements: exprs, .. } => {
-                for e in exprs { self.collect_send_sites(e, self_class, side, helpers, out); }
+                for e in exprs { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
-                    self.collect_send_sites(k, self_class, side, helpers, out);
-                    self.collect_send_sites(v, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(k, self_class, side, helpers, out, reads);
+                    self.collect_send_sites_reading(v, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::ForwardKeywordsWithPairs { entries } => {
                 for (key, value) in entries {
-                    self.collect_send_sites(key, self_class, side, helpers, out);
-                    self.collect_send_sites(value, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(key, self_class, side, helpers, out, reads);
+                    self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::If { cond, then_branch, else_branch } => {
-                self.collect_send_sites(cond, self_class, side, helpers, out);
-                self.collect_send_sites(then_branch, self_class, side, helpers, out);
-                self.collect_send_sites(else_branch, self_class, side, helpers, out);
+                self.collect_send_sites_reading(cond, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(then_branch, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(else_branch, self_class, side, helpers, out, reads);
             }
             ExprNode::Case { scrutinee, arms } => {
-                self.collect_send_sites(scrutinee, self_class, side, helpers, out);
+                self.collect_send_sites_reading(scrutinee, self_class, side, helpers, out, reads);
                 for arm in arms {
-                    if let Some(g) = &arm.guard { self.collect_send_sites(g, self_class, side, helpers, out); }
-                    self.collect_send_sites(&arm.body, self_class, side, helpers, out);
+                    if let Some(g) = &arm.guard { self.collect_send_sites_reading(g, self_class, side, helpers, out, reads); }
+                    self.collect_send_sites_reading(&arm.body, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::CaseMatch { scrutinee, arms, else_body } => {
-                self.collect_send_sites(scrutinee, self_class, side, helpers, out);
+                self.collect_send_sites_reading(scrutinee, self_class, side, helpers, out, reads);
                 for arm in arms {
-                    arm.pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, side, helpers, out));
-                    if let Some((_, g)) = &arm.guard { self.collect_send_sites(g, self_class, side, helpers, out); }
-                    self.collect_send_sites(&arm.body, self_class, side, helpers, out);
+                    arm.pattern.for_each_expr(&mut |e| self.collect_send_sites_reading(e, self_class, side, helpers, out, reads));
+                    if let Some((_, g)) = &arm.guard { self.collect_send_sites_reading(g, self_class, side, helpers, out, reads); }
+                    self.collect_send_sites_reading(&arm.body, self_class, side, helpers, out, reads);
                 }
-                if let Some(e) = else_body { self.collect_send_sites(e, self_class, side, helpers, out); }
+                if let Some(e) = else_body { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
             ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
-                self.collect_send_sites(value, self_class, side, helpers, out);
-                pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, side, helpers, out));
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
+                pattern.for_each_expr(&mut |e| self.collect_send_sites_reading(e, self_class, side, helpers, out, reads));
             }
             ExprNode::BoolOp { left, right, .. }
             | ExprNode::RescueModifier { expr: left, fallback: right } => {
-                self.collect_send_sites(left, self_class, side, helpers, out);
-                self.collect_send_sites(right, self_class, side, helpers, out);
+                self.collect_send_sites_reading(left, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(right, self_class, side, helpers, out, reads);
             }
             ExprNode::Let { value, body, .. } => {
-                self.collect_send_sites(value, self_class, side, helpers, out);
-                self.collect_send_sites(body, self_class, side, helpers, out);
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(body, self_class, side, helpers, out, reads);
             }
-            ExprNode::Lambda { body, .. } => self.collect_send_sites(body, self_class, side, helpers, out),
+            ExprNode::Lambda { body, .. } => self.collect_send_sites_reading(body, self_class, side, helpers, out, reads),
             // A `def` in a block defines on another class (`Class.new`'s):
             // its implicit-self calls are not this class's sites.
             ExprNode::MethodDefExpr { .. } => {}
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
-                    self.collect_send_sites(r, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(r, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::Apply { fun, args, block } => {
-                self.collect_send_sites(fun, self_class, side, helpers, out);
-                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
+                self.collect_send_sites_reading(fun, self_class, side, helpers, out, reads);
+                for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
+                if let Some(b) = block { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
             }
             ExprNode::Assign { target, value }
             | ExprNode::OpAssign { target, value, .. } => {
-                self.collect_send_sites(value, self_class, side, helpers, out);
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads);
                 if let LValue::Attr { recv, .. } = target {
-                    self.collect_send_sites(recv, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(recv, self_class, side, helpers, out, reads);
                 }
                 if let LValue::Index { recv, index } = target {
-                    self.collect_send_sites(recv, self_class, side, helpers, out);
-                    self.collect_send_sites(index, self_class, side, helpers, out);
+                    self.collect_send_sites_reading(recv, self_class, side, helpers, out, reads);
+                    self.collect_send_sites_reading(index, self_class, side, helpers, out, reads);
                 }
             }
             ExprNode::StringInterp { parts } => {
                 for p in parts {
                     if let crate::expr::InterpPart::Expr { expr } = p {
-                        self.collect_send_sites(expr, self_class, side, helpers, out);
+                        self.collect_send_sites_reading(expr, self_class, side, helpers, out, reads);
                     }
                 }
             }
             ExprNode::Yield { args } => {
-                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
+                for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
             }
-            ExprNode::Raise { value } => self.collect_send_sites(value, self_class, side, helpers, out),
-            ExprNode::Return { value } => self.collect_send_sites(value, self_class, side, helpers, out),
+            ExprNode::Raise { value } => self.collect_send_sites_reading(value, self_class, side, helpers, out, reads),
+            ExprNode::Return { value } => self.collect_send_sites_reading(value, self_class, side, helpers, out, reads),
             ExprNode::Super { args, block } => {
                 if let Some(args) = args {
-                    for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
+                    for a in args { self.collect_send_sites_reading(a, self_class, side, helpers, out, reads); }
                 }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
+                if let Some(b) = block { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
             }
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-                self.collect_send_sites(body, self_class, side, helpers, out);
+                self.collect_send_sites_reading(body, self_class, side, helpers, out, reads);
                 for rc in rescues {
-                    for c in &rc.classes { self.collect_send_sites(c, self_class, side, helpers, out); }
-                    self.collect_send_sites(&rc.body, self_class, side, helpers, out);
+                    for c in &rc.classes { self.collect_send_sites_reading(c, self_class, side, helpers, out, reads); }
+                    self.collect_send_sites_reading(&rc.body, self_class, side, helpers, out, reads);
                 }
-                if let Some(e) = else_branch { self.collect_send_sites(e, self_class, side, helpers, out); }
-                if let Some(e) = ensure { self.collect_send_sites(e, self_class, side, helpers, out); }
+                if let Some(e) = else_branch { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
+                if let Some(e) = ensure { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
             ExprNode::Next { value } | ExprNode::Break { value } => {
-                if let Some(v) = value { self.collect_send_sites(v, self_class, side, helpers, out); }
+                if let Some(v) = value { self.collect_send_sites_reading(v, self_class, side, helpers, out, reads); }
             }
             ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
-                self.collect_send_sites(value, self_class, side, helpers, out)
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads)
             }
             ExprNode::MultiAssign { value, .. } => {
-                self.collect_send_sites(value, self_class, side, helpers, out)
+                self.collect_send_sites_reading(value, self_class, side, helpers, out, reads)
             }
             ExprNode::While { cond, body, .. } => {
-                self.collect_send_sites(cond, self_class, side, helpers, out);
-                self.collect_send_sites(body, self_class, side, helpers, out);
+                self.collect_send_sites_reading(cond, self_class, side, helpers, out, reads);
+                self.collect_send_sites_reading(body, self_class, side, helpers, out, reads);
             }
             ExprNode::Range { begin, end, .. } => {
-                if let Some(b) = begin { self.collect_send_sites(b, self_class, side, helpers, out); }
-                if let Some(e) = end { self.collect_send_sites(e, self_class, side, helpers, out); }
+                if let Some(b) = begin { self.collect_send_sites_reading(b, self_class, side, helpers, out, reads); }
+                if let Some(e) = end { self.collect_send_sites_reading(e, self_class, side, helpers, out, reads); }
             }
-            ExprNode::Cast { value, .. } => self.collect_send_sites(value, self_class, side, helpers, out),
+            ExprNode::Cast { value, .. } => self.collect_send_sites_reading(value, self_class, side, helpers, out, reads),
             ExprNode::Lit { .. }
             | ExprNode::Var { .. }
             | ExprNode::Ivar { .. }
@@ -11490,6 +11466,102 @@ mod yield_only_local_tests {
 /// registry: every return leaf is a `yield`, a local, or a call with a
 /// block. It answers yes only for such a body, and this part of its rule
 /// reads nothing but the tree.
+/// The callees whose verdicts decide `returns_block_value` for a body:
+/// each `(receiver type, method)` a leaf hands its block on to.
+type BlockValueAsks = Vec<(Option<Ty>, Symbol)>;
+
+/// What `returns_block_value` reads off the body alone: `None` when it
+/// answers false whatever the registry holds, otherwise the callees whose
+/// verdicts must all hold (see `Analyzer::block_value_asks_hold`). A
+/// function of the typed tree, so it is kept with the trees print.
+fn block_value_plan(owner: &ClassId, method: &Symbol, body: &Expr, block_param: Option<&Symbol>) -> Option<BlockValueAsks> {
+    let leaves = return_leaves(body);
+    // Only campfire's explicit `RecordCache#fetch` contract answers
+    // its block's value, a local that only ever holds it, or — on a
+    // hit — the records a snapshot of that value rebuilds:
+    // `….map { |name, attrs| name.constantize.instantiate(attrs) }`
+    // (analysis sees the source; `lower::record_snapshot` later makes
+    // it `ActiveRecord::Base.instantiate_named`, accepted too). The rebuild is typed as the
+    // block's value on the claim that the snapshot under a key was
+    // taken from what this block returned for that key: the same
+    // records, in order, of the same classes. That is the contract the
+    // cache relies on in Rails too; a snapshot of anything else would
+    // be the app's bug under either runtime. This is a domain contract,
+    // not a fact recoverable from arbitrary serialized data: callers
+    // must not reuse a key for a different result shape. The
+    // cache-through contract test exercises miss/hit reconstruction,
+    // ordering, and distinct Article/Comment keys.
+    let yield_locals = yield_only_locals(body);
+    let record_cache_fetch = method.as_str() == "fetch"
+        && matches!(owner.0.as_str(), "RecordCache" | "Campfire::RecordCache");
+    let rebuild = |leaf: &Expr| {
+        record_cache_fetch &&
+        matches!(&*leaf.node, ExprNode::Send { method, block: Some(b), .. }
+            if method.as_str() == "map"
+                && matches!(&*b.node, ExprNode::Lambda { body, .. }
+                    if return_leaves(body).iter().all(|l| snapshot_rebuild(l))))
+    };
+    // The rebuild is only ever the block's value AGAIN: some path must
+    // answer the block's value itself.
+    let direct = leaves.iter().any(|leaf| match &*leaf.node {
+        ExprNode::Yield { .. } => true,
+        ExprNode::Var { name, .. } => yield_locals.contains(name),
+        _ => false,
+    });
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut asks = Vec::new();
+    for leaf in &leaves {
+        let holds = match &*leaf.node {
+            ExprNode::Yield { .. } => true,
+            ExprNode::Var { name, .. } => yield_locals.contains(name),
+            _ if direct && rebuild(leaf) => true,
+            ExprNode::Send { recv, method, block: Some(b), .. } => {
+                let forwards = matches!(
+                    (&*b.node, block_param),
+                    (ExprNode::Var { name, .. }, Some(bp)) if name == bp
+                );
+                // `Rails.cache` by its spelling too: app analysis
+                // does not type it (the runtime's RBS is not in the
+                // app registry), and `fetch` on the framework's
+                // store answers the block's value, fresh or cached.
+                let rails_cache = method.as_str() == "fetch"
+                    && recv.as_ref().is_some_and(|r| crate::lower::rails_cache::is_rails_cache(r));
+                if forwards && !rails_cache {
+                    // The callee's own verdict, asked of the registry.
+                    let recv_ty = match recv {
+                        Some(r) => r.ty.clone(),
+                        None => Some(Ty::Class { id: owner.clone(), args: vec![].into() }),
+                    };
+                    asks.push((recv_ty, method.clone()));
+                }
+                forwards
+            }
+            _ => false,
+        };
+        if !holds {
+            return None;
+        }
+    }
+    Some(asks)
+}
+
+/// [`block_value_plan`] of each of a library class's methods, read
+/// without keeping a stored body; `None` for a body
+/// [`block_value_candidate`] rules out.
+fn library_block_value_plans(owner: &ClassId, methods: &[crate::dialect::MethodDef]) -> Vec<Option<BlockValueAsks>> {
+    methods
+        .iter()
+        .map(|method| {
+            let block_param = method.block_param.as_ref().map(|p| &p.name);
+            method.body.with_expr(|body| {
+                block_value_candidate(body).then(|| block_value_plan(owner, &method.name, body, block_param)).flatten()
+            })
+        })
+        .collect()
+}
+
 fn block_value_candidate(body: &Expr) -> bool {
     let leaves = return_leaves(body);
     !leaves.is_empty()
