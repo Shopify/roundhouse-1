@@ -63,7 +63,7 @@ fn try_transform(m: &MethodDef) -> Option<Vec<MethodDef>> {
     // The `if` is the whole body, or the sole statement of the body Seq.
     let body_is_seq = matches!(&*m.body.node, ExprNode::Seq { .. });
     let if_expr = match &*m.body.node {
-        ExprNode::If { .. } => Some(m.body.clone()),
+        ExprNode::If { .. } => Some((*m.body).clone()),
         ExprNode::Seq { exprs } if exprs.len() == 1 => {
             matches!(&*exprs[0].node, ExprNode::If { .. }).then(|| exprs[0].clone())
         }
@@ -78,10 +78,10 @@ fn try_transform(m: &MethodDef) -> Option<Vec<MethodDef>> {
             continue;
         }
         let mut temp = m.clone();
-        temp.body = branch.clone();
+        temp.body = branch.clone().into();
         if let Some(mut pair) = try_transform_seq(&temp) {
             let helper = pair.pop()?; // [entry, helper]
-            let entry_branch = pair.pop()?.body;
+            let entry_branch = pair.pop()?.body.into_expr();
             let (nt, ne) = if in_then {
                 (entry_branch, else_branch.clone())
             } else {
@@ -94,9 +94,9 @@ fn try_transform(m: &MethodDef) -> Option<Vec<MethodDef>> {
             });
             let mut entry = m.clone();
             entry.body = if body_is_seq {
-                syn(ExprNode::Seq { exprs: vec![new_if] })
+                (syn(ExprNode::Seq { exprs: vec![new_if] })).into()
             } else {
-                new_if
+                new_if.into()
             };
             return Some(vec![entry, helper]);
         }
@@ -260,7 +260,7 @@ fn try_transform_seq(m: &MethodDef) -> Option<Vec<MethodDef>> {
         receiver: m.receiver,
         params: helper_params,
         block_param: None,
-        body: syn(ExprNode::If {
+        body: (syn(ExprNode::If {
             cond: cond.clone(),
             then_branch: cps(&body_stmts, &recurse_call),
             // Post-loop value. A record-threading helper must yield the
@@ -282,7 +282,7 @@ fn try_transform_seq(m: &MethodDef) -> Option<Vec<MethodDef>> {
             } else {
                 value_of(post)
             },
-        }),
+        })).into(),
         signature: None,
         effects: m.effects.clone(),
         enclosing_class: m.enclosing_class.clone(),
@@ -295,7 +295,7 @@ fn try_transform_seq(m: &MethodDef) -> Option<Vec<MethodDef>> {
     // ending in the initial call into the helper. CPS so a pre-loop
     // guard (`return X if c`) becomes an `if`, not a bare `return`.
     let mut entry = m.clone();
-    entry.body = cps(pre, &recurse_call);
+    entry.body = cps(pre, &recurse_call).into();
 
     Some(vec![entry, helper])
 }
@@ -838,7 +838,7 @@ mod tests {
             receiver,
             params: params.iter().map(|p| Param::positional(sym(p))).collect(),
             block_param: None,
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,

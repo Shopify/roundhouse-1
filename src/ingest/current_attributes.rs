@@ -336,7 +336,7 @@ fn fill_default_bodies(methods: &mut [MethodDef], defaults: &[(Symbol, DefaultBo
             DefaultBody::Dynamic(value) => (default_value_method(attr.as_str()), value.clone()),
         };
         if let Some(m) = methods.iter_mut().find(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name) {
-            m.body = body;
+            m.body = body.into();
         }
     }
 }
@@ -378,9 +378,9 @@ fn prepend_default_assignments(lc: &mut LibraryClass, defaults: &[(Symbol, Defau
         .collect();
     match &*init.body.node {
         ExprNode::Seq { exprs: rest } => exprs.extend(rest.iter().cloned()),
-        _ => exprs.push(init.body.clone()),
+        _ => exprs.push((*init.body).clone()),
     }
-    init.body = Expr::new(span, ExprNode::Seq { exprs });
+    init.body = (Expr::new(span, ExprNode::Seq { exprs })).into();
 }
 
 /// `delegate :host, :protocol, to: :request, prefix: true, allow_nil: true`.
@@ -523,7 +523,7 @@ fn fill_reset_callback_blocks(methods: &mut [MethodDef], callbacks: &[(ResetPhas
             .iter_mut()
             .find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == name)
         {
-            m.body = body.clone();
+            m.body = body.clone().into();
         }
     }
 }

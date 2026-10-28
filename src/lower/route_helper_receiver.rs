@@ -229,7 +229,7 @@ pub fn qualify_lcs(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
         .collect();
     for (lc, shadows) in lcs.iter_mut().zip(shadow_sets.iter()) {
         for m in &mut lc.methods {
-            m.body = qualify(&m.body, &answered, shadows, &id_segments);
+            m.body = qualify(&m.body, &answered, shadows, &id_segments).into();
         }
     }
 }
@@ -263,7 +263,7 @@ mod tests {
             name: Symbol::from(name),
             receiver: MethodReceiver::Instance,
             params: vec![],
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::default(),
             enclosing_class: None,

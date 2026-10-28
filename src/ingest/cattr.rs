@@ -234,7 +234,7 @@ fn var(span: Span, name: &Symbol) -> Expr {
 /// `def (self.)name; @@name; end`.
 pub(crate) fn reader(owner: &ClassId, name: &Symbol, receiver: MethodReceiver) -> MethodDef {
     let mut method = super::library_class::synth_attr_reader(owner, name, receiver);
-    method.body = var(Span::synthetic(), name);
+    method.body = var(Span::synthetic(), name).into();
     method.visibility = MethodVisibility::Public;
     method
 }

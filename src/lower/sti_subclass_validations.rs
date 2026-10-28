@@ -464,7 +464,7 @@ pub(crate) fn instance_method(owner: &ClassId, name: &str, params: Vec<crate::di
         name: Symbol::from(name),
         receiver: MethodReceiver::Instance,
         params,
-        body,
+        body: body.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -553,7 +553,7 @@ fn define_virtual_on_subclass(lc: &mut LibraryClass, name: &Symbol) {
         Some(init) if init.name_span.is_synthetic() => {
             let mut stmts = stmts_of(&init.body);
             stmts.push(assign());
-            init.body = node(ExprNode::Seq { exprs: stmts });
+            init.body = (node(ExprNode::Seq { exprs: stmts })).into();
         }
         Some(_) => {}
         None => {
@@ -573,7 +573,7 @@ fn define_virtual_on_subclass(lc: &mut LibraryClass, name: &Symbol) {
             Some(existing) if existing.name_span.is_synthetic() => {
                 let mut stmts = stmts_of(&existing.body);
                 stmts.insert(0, assign());
-                existing.body = node(ExprNode::Seq { exprs: stmts });
+                existing.body = (node(ExprNode::Seq { exprs: stmts })).into();
             }
             Some(_) => {}
             None => lc.methods.push(instance_method(

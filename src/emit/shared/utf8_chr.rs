@@ -120,9 +120,9 @@ mod tests {
         .unwrap();
         let mut call = methods[0].body.clone();
         if let crate::expr::ExprNode::Seq { exprs } = &*call.node {
-            call = exprs.last().unwrap().clone();
+            call = exprs.last().unwrap().clone().into();
         }
-        call
+        call.into_expr()
     }
 
     /// Every bridge must evaluate one receiver and retain a refusal for

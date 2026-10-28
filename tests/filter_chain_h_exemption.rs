@@ -36,7 +36,7 @@ fn lowered_helper_body(helper_src: &str) -> Expr {
     );
     let mut app = ingest_app_from_tree(tree).expect("ingest");
     roundhouse::session::analyze_and_lower(&mut app);
-    app.library_classes
+    (app.library_classes
         .iter()
         .find(|lc| lc.name.0.as_str() == "MessagesHelper")
         .expect("MessagesHelper not ingested")
@@ -45,7 +45,7 @@ fn lowered_helper_body(helper_src: &str) -> Expr {
         .find(|m| m.name.as_str() == "message_presentation")
         .expect("message_presentation not found")
         .body
-        .clone()
+        .clone()).into_expr()
 }
 
 fn any_expr(e: &Expr, pred: &mut impl FnMut(&Expr) -> bool) -> bool {

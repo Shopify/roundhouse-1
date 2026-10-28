@@ -694,13 +694,13 @@ fn lowered_method(source: &str, method: &str) -> roundhouse::Expr {
     }
     Analyzer::new(&app).analyze(&mut app);
     apply_blank_lowering(&mut app);
-    app.library_classes
+    (app.library_classes
         .iter()
         .flat_map(|lc| lc.methods.iter())
         .find(|m| m.name.as_str() == method)
         .unwrap_or_else(|| panic!("missing {method}"))
         .body
-        .clone()
+        .clone()).into_expr()
 }
 
 #[test]

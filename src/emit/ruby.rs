@@ -3125,7 +3125,7 @@ mod method_sig_tests {
                 Symbol::from("opts"),
                 Expr::new(Span::synthetic(), ExprNode::Hash { entries: vec![], kwargs: false }),
             )],
-            body: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            body: (Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })).into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,

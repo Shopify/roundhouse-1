@@ -591,7 +591,7 @@ mod tests {
             .iter()
             .find(|m| m.name.as_str() == method_name)
             .unwrap_or_else(|| panic!("missing {method_name}"));
-        method.body.clone()
+        (*method.body).clone()
     }
 
     #[test]

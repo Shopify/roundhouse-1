@@ -116,7 +116,7 @@ pub(super) fn push_dom_prefix_method(methods: &mut Vec<MethodDef>, model: &Model
         name: Symbol::from("dom_prefix"),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: with_ty(body, Ty::Str),
+        body: with_ty(body, Ty::Str).into(),
         signature: Some(fn_sig(vec![], Ty::Str)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -160,7 +160,7 @@ pub(super) fn push_to_param_method(methods: &mut Vec<MethodDef>, model: &Model) 
         name: Symbol::from("to_param"),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: with_ty(
+        body: (with_ty(
             Expr::new(
                 Span::synthetic(),
                 ExprNode::Send {
@@ -175,7 +175,7 @@ pub(super) fn push_to_param_method(methods: &mut Vec<MethodDef>, model: &Model) 
                 },
             ),
             Ty::Str,
-        ),
+        )).into(),
         signature: Some(fn_sig(vec![], Ty::Str)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -252,7 +252,7 @@ pub(super) fn push_dom_record_key_method(methods: &mut Vec<MethodDef>, model: &M
         name: Symbol::from("dom_record_key"),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: with_ty(Expr::new(Span::synthetic(), body), Ty::Str),
+        body: with_ty(Expr::new(Span::synthetic(), body), Ty::Str).into(),
         signature: Some(fn_sig(vec![], Ty::Str)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -468,7 +468,7 @@ pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &M
                     name: name.clone(),
                     receiver: MethodReceiver::Instance,
                     params: Vec::new(),
-                    body: Expr::new(expr.span, ExprNode::Ivar { name: name.clone() }),
+                    body: (Expr::new(expr.span, ExprNode::Ivar { name: name.clone() })).into(),
                     signature: None,
                     effects: EffectSet::default(),
                     enclosing_class: Some(model.name.0.clone()),
@@ -488,13 +488,13 @@ pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &M
                     name: setter,
                     receiver: MethodReceiver::Instance,
                     params: vec![Param::positional(value.clone())],
-                    body: Expr::new(
+                    body: (Expr::new(
                         expr.span,
                         ExprNode::Assign {
                             target: LValue::Ivar { name: name.clone() },
                             value: Expr::new(expr.span, ExprNode::Var { id: VarId(0), name: value }),
                         },
-                    ),
+                    )).into(),
                     signature: None,
                     effects: EffectSet::default(),
                     enclosing_class: Some(model.name.0.clone()),
@@ -654,18 +654,18 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                     } else {
                         default
                     };
-                    Expr::new(
+                    (Expr::new(
                         Span::synthetic(),
                         ExprNode::If {
                             cond: Expr::new(Span::synthetic(), ExprNode::Defined { operand: ivar() }),
                             then_branch: ivar(),
                             else_branch: default,
                         },
-                    )
+                    )).into()
                 } else if is_bool {
-                    with_ty(ivar(), Ty::Bool)
+                    with_ty(ivar(), Ty::Bool).into()
                 } else {
-                    ivar()
+                    ivar().into()
                 },
                 signature: if is_bool {
                     Some(super::fn_sig(vec![], Ty::Bool))
@@ -693,7 +693,7 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                 name: predicate,
                 receiver: MethodReceiver::Instance,
                 params: Vec::new(),
-                body: with_ty(
+                body: (with_ty(
                     Expr::new(
                         Span::synthetic(),
                         ExprNode::Send {
@@ -705,7 +705,7 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                         },
                     ),
                     Ty::Bool,
-                ),
+                )).into(),
                 signature: Some(super::fn_sig(vec![], Ty::Bool)),
                 effects: EffectSet::default(),
                 enclosing_class: Some(model.name.0.clone()),
@@ -820,7 +820,7 @@ pub(super) fn push_attribute_api_methods(methods: &mut Vec<MethodDef>, model: &M
                 name: setter,
                 receiver: MethodReceiver::Instance,
                 params: vec![Param::positional(value)],
-                body,
+                body: body.into(),
                 signature: None,
                 effects: EffectSet::default(),
                 enclosing_class: Some(model.name.0.clone()),
@@ -849,13 +849,13 @@ pub(super) fn push_unknown_marker_methods(methods: &mut Vec<MethodDef>, model: &
                         name: Symbol::from("abstract?"),
                         receiver: MethodReceiver::Class,
                         params: Vec::new(),
-                        body: with_ty(
+                        body: (with_ty(
                             Expr::new(
                                 expr.span,
                                 ExprNode::Lit { value: Literal::Bool { value: true } },
                             ),
                             Ty::Bool,
-                        ),
+                        )).into(),
                         signature: Some(fn_sig(vec![], Ty::Bool)),
                         effects: EffectSet::default(),
                         enclosing_class: Some(model.name.0.clone()),
@@ -947,14 +947,14 @@ fn fold_into_or_push_at(methods: &mut Vec<MethodDef>, model: &Model, hook_name: 
     if let Some(existing) = methods.iter_mut().find(|m| m.name == hook) {
         let mut stmts = match &*existing.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
-            _ => vec![existing.body.clone()],
+            _ => vec![(*existing.body).clone()],
         };
         if front {
             stmts.insert(0, call);
         } else {
             stmts.push(call);
         }
-        existing.body = seq(stmts);
+        existing.body = seq(stmts).into();
     } else {
         methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,
@@ -964,7 +964,7 @@ fn fold_into_or_push_at(methods: &mut Vec<MethodDef>, model: &Model, hook_name: 
             name: hook,
             receiver: MethodReceiver::Instance,
             params: Vec::new(),
-            body: call,
+            body: call.into(),
             signature: Some(fn_sig(vec![], Ty::Nil)),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1272,7 +1272,7 @@ fn str_method(model: &Model, name: &str, body: Expr) -> MethodDef {
         name: Symbol::from(name),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature: Some(fn_sig(vec![], Ty::Str)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -2268,13 +2268,13 @@ fn push_block_callback(
             // source order (existing body's stmts first, then this block's).
             let mut stmts = match &*existing.body.node {
                 ExprNode::Seq { exprs } => exprs.clone(),
-                _ => vec![existing.body.clone()],
+                _ => vec![(*existing.body).clone()],
             };
             match &*lambda_body.node {
                 ExprNode::Seq { exprs } => stmts.extend(exprs.clone()),
                 _ => stmts.push(lambda_body.clone()),
             }
-            existing.body = seq(stmts);
+            existing.body = seq(stmts).into();
         } else {
             methods.push(hook_like_method(model, hook_sym, lambda_body));
         }
@@ -2303,7 +2303,7 @@ fn hook_like_method(model: &Model, name: Symbol, body: Expr) -> MethodDef {
         name,
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),

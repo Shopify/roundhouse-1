@@ -1182,7 +1182,7 @@ fn define_generic_application(app: &mut crate::App, declared: &crate::det::HashS
             params: vec![crate::dialect::Param::rest(Symbol::from("types"))],
             unsupported_formals: None,
             has_anonymous_block: false,
-            body: Expr::new(span, ExprNode::SelfRef),
+            body: Expr::new(span, ExprNode::SelfRef).into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(lc.name.0.clone()),

@@ -212,7 +212,7 @@ fn nil_unsaved_id(lc: &mut LibraryClass, model: &Model, table: &Table) {
         }
         let nilable = |t: Ty| Ty::Union { variants: vec![t, Ty::Nil].into() };
         let ty = m.body.ty.clone().map(nilable);
-        m.body = id_value(col);
+        m.body = id_value(col).into();
         m.body.ty = ty;
         if let Some(Ty::Fn { ret, .. }) = &mut m.signature {
             *ret = std::sync::Arc::new(nilable((**ret).clone()));
@@ -235,11 +235,11 @@ fn nil_unsaved_param(lc: &mut LibraryClass) {
         }
         let id = || send(self_ref(), "id", vec![]);
         let ty = m.body.ty.clone().map(|t| Ty::Union { variants: vec![t, Ty::Nil].into() });
-        m.body = sp(ExprNode::If {
+        m.body = (sp(ExprNode::If {
             cond: send(id(), "nil?", vec![]),
             then_branch: lit(Literal::Nil),
             else_branch: send(id(), "to_s", vec![]),
-        });
+        })).into();
         m.body.ty = ty;
     }
 }
@@ -673,7 +673,7 @@ fn public_attributes(lc: &mut LibraryClass, model: &Model, table: &Table) {
         }
     }
     let ty = method.body.ty.clone();
-    method.body = sp(ExprNode::Hash { entries: public, kwargs: false });
+    method.body = (sp(ExprNode::Hash { entries: public, kwargs: false })).into();
     method.body.ty = ty;
     lc.methods.insert(at + 1, method);
 }
@@ -699,13 +699,13 @@ fn id_value(col: &Column) -> Expr {
 /// A temporal column's Date or Time: its compiled reader's body where
 /// the model has one, else the parse of its stored text.
 fn temporal_value(lc: &LibraryClass, col: &Column) -> Expr {
-    lc.methods
+    (lc.methods
         .iter()
         .find(|m| {
             m.receiver == MethodReceiver::Instance && m.name == col.name && m.name_span.is_synthetic() && m.params.is_empty()
         })
         .map(|m| m.body.clone())
         .unwrap_or_else(|| {
-            send(konst("ActiveSupport"), temporal_seam(col).1, vec![sp(ExprNode::Ivar { name: col_storage_name(col) })])
-        })
+            (send(konst("ActiveSupport"), temporal_seam(col).1, vec![sp(ExprNode::Ivar { name: col_storage_name(col) })])).into()
+        })).into_expr()
 }

@@ -662,8 +662,11 @@ pub fn census(stage: &str, app: &crate::App) {
     let mut class_body_bytes = 0i64;
     for class in library_classes {
         for method in &class.methods {
+            // A stored body clones as its handle and is not decoded here.
             method_body_sizes.push(live_delta(|| method.body.clone()));
-            count_nodes(&method.body, &mut nodes);
+            if let Some(body) = method.body.resident() {
+                count_nodes(body, &mut nodes);
+            }
         }
         class_body_bytes += live_delta(|| {
             (

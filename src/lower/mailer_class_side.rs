@@ -165,7 +165,7 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
             // kind all carry over), then swap receiver + body.
             let mut w = m.clone();
             w.receiver = crate::dialect::MethodReceiver::Class;
-            w.body = body;
+            w.body = body.into();
             wrappers.push(w);
         }
         if parameterized.contains(lc.name.0.as_str()) && !class_side.contains("with") {
@@ -238,7 +238,7 @@ fn parameterized_constructor(mailer: &crate::ident::ClassId) -> crate::dialect::
         name: Symbol::from("with"),
         receiver: crate::dialect::MethodReceiver::Class,
         params: vec![crate::dialect::Param::positional(params.clone())],
-        body,
+        body: body.into(),
         signature: Some(Ty::Fn {
             params: vec![crate::ty::Param { name: params, ty: params_ty.into(), kind: crate::ty::ParamKind::Required }].into(),
             block: None,

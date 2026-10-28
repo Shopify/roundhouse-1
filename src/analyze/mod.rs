@@ -224,6 +224,10 @@ pub struct Analyzer {
     const_memo: ConstMemo,
     /// Per-library-class method body returns (`harvest_method_returns`).
     return_cache: Vec<Option<ReturnsAt>>,
+    /// Per library class, which methods' bodies could answer their block's
+    /// value, read from the trees print the flags were taken at
+    /// (`harvest_block_value_methods`).
+    block_value_candidates: Vec<Option<(ClassId, u64, Vec<bool>)>>,
     /// Per-library-class hits of the library setup's tree scans.
     setup_scan: setup_scan::SetupScan,
     /// Library-class constant initializer typings across passes.
@@ -251,6 +255,9 @@ pub struct Analyzer {
         HashMap<ClassId, (HashMap<Symbol, HashMap<Symbol, Ty>>, HashMap<Symbol, Expr>)>,
     /// What the opt-in fixpoint canaries saw (`fixpoint_check`).
     fixpoint_checks: fixpoint_check::Checks,
+    /// Where the library pass keeps the method bodies it has typed, when
+    /// `ROUNDHOUSE_STORE` asks for it ([`crate::store`]).
+    store: Option<std::sync::Arc<crate::store::Store>>,
 }
 
 /// One library class's method body returns, as `method_return_ty` read
@@ -1646,10 +1653,12 @@ impl Analyzer {
             init_memo: Vec::new(),
             setup_scan: Default::default(),
             return_cache: Vec::new(),
+            block_value_candidates: Vec::new(),
             view_seeds: None,
             callers_by_target: HashMap::default(),
             controller_action_meta_cache: HashMap::default(),
             fixpoint_checks: fixpoint_check::Checks::default(),
+            store: crate::store::from_env(),
         }
     }
 
@@ -1775,6 +1784,7 @@ impl Analyzer {
         self.init_memo = Vec::new();
         self.setup_scan = Default::default();
         self.return_cache = Vec::new();
+        self.block_value_candidates = Vec::new();
         self.incremental = incremental::Incremental::new(self.incremental.mode);
         self.fixpoint_checks = fixpoint_check::Checks::start();
         // An unresolvable include is a load-time error, not an open method
@@ -2277,6 +2287,16 @@ impl Analyzer {
 
         self.stamp_inferred_method_signatures(app);
         self.report_fixpoint_checks(app);
+        // What the steps since the effects stamp read or retyped goes
+        // back to the store too, so analysis hands over stored bodies.
+        if let Some(store) = &self.store {
+            for lc in &mut app.library_classes {
+                for method in &mut lc.methods {
+                    method.body.spill(store);
+                }
+            }
+            crate::timings::note(store.summary());
+        }
     }
 
     /// Type the bodies of `direct :name do |…| … end` helpers, with the
@@ -3739,7 +3759,7 @@ impl Analyzer {
                         // write of its own (`authorize`) still needs its
                         // typed body as a resolution target for
                         // `collect_transitive_filter_ivars`.
-                        action_bodies.entry(method.name.clone()).or_insert_with(|| body.clone());
+                        action_bodies.entry(method.name.clone()).or_insert_with(|| (*body).clone());
                     }
                 }
             } else if let Some((cached_bindings, cached_bodies)) =
@@ -4864,6 +4884,7 @@ impl Analyzer {
             .map(|lc| lc.name.clone())
             .collect();
         drop(library_modules);
+        let app_library_len = app.library_classes.len();
         for (index, lc) in app.library_classes.iter_mut().enumerate() {
             if let Some(row) = mailer_with_params.get(&lc.name) {
                 let created = !self.classes.contains_key(&lc.name);
@@ -5117,8 +5138,40 @@ impl Analyzer {
                 concern_env_here,
                 writes_here,
             );
+            // Typed and recorded: until a later pass retypes the class, its
+            // bodies are read only where the summaries do not answer. The
+            // returns harvest reads these bodies next, so it is answered
+            // now, while they are on the heap, exactly as it would answer.
+            if let Some(store) = self.store.clone() {
+                if mode != incremental::Mode::Off {
+                    if self.return_cache.len() != app_library_len {
+                        self.return_cache = (0..app_library_len).map(|_| None).collect();
+                    }
+                    let classes_now = self.classes.len();
+                    let returns = lc.methods.iter().map(|method| (classes_now, self.method_return_ty(&lc_name, method))).collect();
+                    self.return_cache[index] = Some(ReturnsAt { name: lc_name.clone(), print: trees_after, returns });
+                    if self.block_value_candidates.len() != app_library_len {
+                        self.block_value_candidates = (0..app_library_len).map(|_| None).collect();
+                    }
+                    let flags = lc.methods.iter().map(|method| block_value_candidate(&method.body)).collect();
+                    self.block_value_candidates[index] = Some((lc_name.clone(), trees_after, flags));
+                }
+                for method in &mut lc.methods {
+                    method.body.spill(&store);
+                }
+            }
         }
         self.incremental.end_pass();
+        // Drop the copies read back since the class was stored, and store
+        // what another phase brought back to the heap.
+        if let Some(store) = &self.store {
+            for lc in &mut app.library_classes {
+                for method in &mut lc.methods {
+                    method.body.spill(store);
+                }
+            }
+            crate::timings::note(store.summary());
+        }
         crate::timings::note(format_args!("library pass trees prints: {:.2}s", print_time.as_secs_f64()));
         drop(_typing_library);
 
@@ -6058,7 +6111,7 @@ impl Analyzer {
                     }
                     _ => {
                         read_returns += 1;
-                        let ret = self.method_return_ty(class_id, method);
+                        let ret = method.body.with_expr(|body| self.body_return_ty(method.signature.as_ref(), body));
                         if let Some((_, old)) = kept {
                             assert!(
                                 *old == ret,
@@ -6170,14 +6223,47 @@ impl Analyzer {
                 }
             }
         }
-        for lc in &app.library_classes {
-            for method in &lc.methods {
+        // Whether a body could answer its block's value does not depend
+        // on the registry (`block_value_candidate`), so a library class
+        // whose trees are unchanged keeps its flags and only its
+        // candidates' bodies are read again.
+        let mode = self.incremental.mode;
+        let mut candidates = std::mem::take(&mut self.block_value_candidates);
+        if candidates.len() != app.library_classes.len() {
+            candidates = (0..app.library_classes.len()).map(|_| None).collect();
+        }
+        for (index, lc) in app.library_classes.iter().enumerate() {
+            let print = if mode == incremental::Mode::Off { None } else { self.incremental.trees_of(index, &lc.name) };
+            let slot = &mut candidates[index];
+            let kept = slot.as_ref().filter(|(name, at, flags)| {
+                *name == lc.name && Some(*at) == print && flags.len() == lc.methods.len()
+            });
+            let flags: Vec<bool> = match kept {
+                Some((_, _, flags)) if mode == incremental::Mode::On => flags.clone(),
+                _ => {
+                    let flags: Vec<bool> = lc.methods.iter().map(|method| block_value_candidate(&method.body)).collect();
+                    if let Some((_, _, old)) = kept {
+                        assert!(
+                            *old == flags,
+                            "ROUNDHOUSE_INCREMENTAL=check: {} kept block-value candidates differ from its bodies'",
+                            lc.name.0.as_str()
+                        );
+                    }
+                    *slot = print.map(|at| (lc.name.clone(), at, flags.clone()));
+                    flags
+                }
+            };
+            for (method, candidate) in lc.methods.iter().zip(flags) {
+                if !candidate {
+                    continue;
+                }
                 let bp = method.block_param.as_ref().map(|p| &p.name);
                 if self.returns_block_value(&lc.name, &method.name, &method.body, bp) {
                     found.push((lc.name.clone(), method.name.clone()));
                 }
             }
         }
+        self.block_value_candidates = candidates;
         for controller in &app.controllers {
             for action in controller.actions() {
                 if self.returns_block_value(
@@ -6542,17 +6628,22 @@ impl Analyzer {
     /// the call-site fact, the harvest the function's, and a compiled
     /// target (spinel) returns what the function returns.
     fn method_return_ty(&self, _class_id: &ClassId, method: &crate::dialect::MethodDef) -> Option<Ty> {
+        self.body_return_ty(method.signature.as_ref(), &method.body)
+    }
+
+    /// [`Self::method_return_ty`] of a method with this signature and body.
+    fn body_return_ty(&self, signature: Option<&Ty>, body: &Expr) -> Option<Ty> {
         // A declared signature (ingest-expanded DSL, RBS, …) wins over
         // body harvest: `delegated_type`'s `def page; leafable if page?;
         // end` body types as the full polymorphic union, but the useful
         // call-site answer is `Page | nil`.
-        if let Some(Ty::Fn { ret, .. }) = &method.signature {
+        if let Some(Ty::Fn { ret, .. }) = signature {
             return Some((**ret).clone());
         }
-        self.class_object_return_ty(&method.body)
-            .or_else(|| self.shared_base_return_ty(&method.body))
-            .or_else(|| tuple_return_ty(&method.body))
-            .or_else(|| effective_return_ty(&method.body))
+        self.class_object_return_ty(body)
+            .or_else(|| self.shared_base_return_ty(body))
+            .or_else(|| tuple_return_ty(body))
+            .or_else(|| effective_return_ty(body))
     }
 
     /// A method whose every return value is a class constant returns
@@ -6860,7 +6951,7 @@ impl Analyzer {
             }
             for body in module.helpers.iter().flat_map(|method| {
                 method.params.iter().filter_map(|param| param.default.as_ref())
-                    .chain(std::iter::once(&method.body))
+                    .chain(std::iter::once(&*method.body))
             })
                 .chain(module.tests.iter().map(|test| &test.body)) {
                 self.collect_send_sites(body, Some(&module.name), MethodReceiver::Instance, helpers, &mut test_sites);
@@ -11378,6 +11469,18 @@ mod yield_only_local_tests {
     }
 }
 
+/// Whether `returns_block_value` could answer yes for `body` under some
+/// registry: every return leaf is a `yield`, a local, or a call with a
+/// block. It answers yes only for such a body, and this part of its rule
+/// reads nothing but the tree.
+fn block_value_candidate(body: &Expr) -> bool {
+    let leaves = return_leaves(body);
+    !leaves.is_empty()
+        && leaves.iter().all(|leaf| {
+            matches!(&*leaf.node, ExprNode::Yield { .. } | ExprNode::Var { .. } | ExprNode::Send { block: Some(_), .. })
+        })
+}
+
 pub(crate) fn return_leaves(body: &Expr) -> Vec<&Expr> {
     fn tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         match &*e.node {
@@ -11531,7 +11634,7 @@ impl Analyzer {
     /// (`ROUNDHOUSE_MEMORY_CENSUS=1`). Destructured without `..`, so a new
     /// field has to be listed here; the `Copy` flags and counters own no heap.
     pub fn census_drop(self) {
-        let Analyzer { classes, inferred_params, declared_signatures, adapter, concern_folded, host_folded, catalog_lent, extension_modules, inquirers, load_hook_bases, i18n, i18n_gem: _, helper_modules, open_classes, refined_action_bindings, const_resolver, source_indexed: _, gem_sources, extensions, typed_constants, data_factories, recursive_methods, fixpoint_rounds: _, constant_rounds: _, incremental, param_tables, site_cache, const_memo, return_cache, setup_scan, init_memo, class_factories, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_checks } = self;
+        let Analyzer { classes, inferred_params, declared_signatures, adapter, concern_folded, host_folded, catalog_lent, extension_modules, inquirers, load_hook_bases, i18n, i18n_gem: _, helper_modules, open_classes, refined_action_bindings, const_resolver, source_indexed: _, gem_sources, extensions, typed_constants, data_factories, recursive_methods, fixpoint_rounds: _, constant_rounds: _, incremental, param_tables, site_cache, const_memo, return_cache, block_value_candidates, setup_scan, init_memo, class_factories, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_checks, store: _ } = self;
         let mut freed: Vec<(&str, i64)> = vec![
             ("classes", crate::memory_census::freed_by(|| drop(classes))),
             ("inferred_params", crate::memory_census::freed_by(|| drop(inferred_params))),
@@ -11558,6 +11661,7 @@ impl Analyzer {
             ("site_cache", crate::memory_census::freed_by(|| drop(site_cache))),
             ("const_memo", crate::memory_census::freed_by(|| drop(const_memo))),
             ("return_cache", crate::memory_census::freed_by(|| drop(return_cache))),
+            ("block_value_candidates", crate::memory_census::freed_by(|| drop(block_value_candidates))),
             ("setup_scan", crate::memory_census::freed_by(|| drop(setup_scan))),
             ("init_memo", crate::memory_census::freed_by(|| drop(init_memo))),
             ("class_factories", crate::memory_census::freed_by(|| drop(class_factories))),

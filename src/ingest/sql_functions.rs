@@ -155,7 +155,7 @@ fn method(
         name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params,
-        body,
+        body: body.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(Symbol::from("SqlFunctions")),

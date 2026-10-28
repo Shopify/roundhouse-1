@@ -127,8 +127,8 @@ fn accept_string_name(m: &mut MethodDef) {
         }),
         else_branch: sp(ExprNode::Lit { value: Literal::Nil }),
     });
-    let body = std::mem::replace(&mut m.body, sp(ExprNode::Lit { value: Literal::Nil }));
-    m.body = sp(ExprNode::Seq { exprs: vec![to_sym, body] });
+    let body = std::mem::replace(&mut m.body, (sp(ExprNode::Lit { value: Literal::Nil })).into());
+    m.body = (sp(ExprNode::Seq { exprs: vec![to_sym, body.into_expr()] })).into();
     if let Some(Ty::Fn { params, .. }) = m.signature.as_mut() {
         if let Some(first) = params.first_mut() {
             first.ty = std::sync::Arc::new(Ty::Union { variants: vec![Ty::Sym, Ty::Str].into() });
@@ -165,7 +165,7 @@ fn schema_column_types(model: &Model, table: &Table, adapter: Option<&DatabaseAd
         name: Symbol::from("schema_column_types"),
         receiver: MethodReceiver::Class,
         params: Vec::new(),
-        body: typed(ExprNode::Hash { entries, kwargs: false }, ret.clone()),
+        body: (typed(ExprNode::Hash { entries, kwargs: false }, ret.clone())).into(),
         signature: Some(crate::lower::model_to_library::fn_sig(vec![], ret)),
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),

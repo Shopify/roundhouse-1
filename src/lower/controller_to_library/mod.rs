@@ -1070,7 +1070,7 @@ fn subclass_template_hooks(
                 name: hook.clone(),
                 receiver: MethodReceiver::Instance,
                 params: vec![],
-                body,
+                body: body.into(),
                 signature: Some(crate::lower::typing::fn_sig(vec![], Ty::Str)),
                 effects: EffectSet::default(),
                 enclosing_class: Some(controller.name.0.clone()),
@@ -1438,7 +1438,7 @@ fn build_methods(
         // on nodes it has already touched, so every dispatcher gets it —
         // the next block filter that names a helper would otherwise stay bare.
         dispatcher.body =
-            rewrite_controller_route_helpers(&dispatcher.body, &shadows, route_id_segments);
+            rewrite_controller_route_helpers(&dispatcher.body, &shadows, route_id_segments).into();
         methods.insert(dispatcher_at, dispatcher);
     }
     // The empty set for both non-public loops below: `is_public: false`
@@ -1583,7 +1583,7 @@ fn synthesize_controller_string_method(
         name: Symbol::from(name),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body,
+        body: body.into(),
         signature: Some(crate::lower::typing::fn_sig(vec![], Ty::Str)),
         effects: EffectSet::default(),
         enclosing_class: Some(controller.name.0.clone()),
@@ -3085,7 +3085,7 @@ fn action_to_method(
         name: Symbol::from(method_name),
         receiver: MethodReceiver::Instance,
         params,
-        body,
+        body: body.into(),
         signature: Some(signature),
         effects: a.effects.clone(),
         enclosing_class: Some(controller.name.0.clone()),

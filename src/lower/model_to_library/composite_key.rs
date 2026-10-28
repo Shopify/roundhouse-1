@@ -77,9 +77,9 @@ pub(super) fn rekey(methods: &mut Vec<MethodDef>, model: &Model, table: &Table) 
             }
             // A generated one comes back from the INSERT.
             _ => {
-                let old = std::mem::replace(&mut insert.body, Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }));
-                let assign = Expr::new(Span::synthetic(), ExprNode::Assign { target: LValue::Ivar { name: key }, value: old });
-                insert.body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign, parse_body("id\n")] });
+                let old = std::mem::replace(&mut insert.body, (Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })).into());
+                let assign = Expr::new(Span::synthetic(), ExprNode::Assign { target: LValue::Ivar { name: key }, value: old.into_expr() });
+                insert.body = (Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign, parse_body("id\n")] })).into();
             }
         }
         insert.signature = Some(fn_sig(vec![], Ty::Untyped));
@@ -149,7 +149,7 @@ pub(super) fn rekey_identity(methods: &mut [MethodDef], model: &Model) {
         }
         match m.name.as_str() {
             "to_param" | "dom_record_key" if reads_id_to_s(&m.body) => {
-                m.body = super::with_ty(parse_body("id.join(\"_\")\n"), Ty::Str);
+                m.body = super::with_ty(parse_body("id.join(\"_\")\n"), Ty::Str).into();
             }
             "cache_key" | "cache_key_with_version" => replace_id_ivar(&mut m.body),
             _ => {}
@@ -167,7 +167,7 @@ fn key_storage(columns: &[&Column]) -> Symbol {
 fn parse_body(source: &str) -> Expr {
     let wrapped = format!("def __composite_key\n{source}end\n");
     let mut methods = crate::runtime_src::parse_methods(&wrapped).expect("composite key body parses");
-    methods.remove(0).body
+    methods.remove(0).body.into_expr()
 }
 
 fn fires_after_initialize(expr: &Expr) -> bool {

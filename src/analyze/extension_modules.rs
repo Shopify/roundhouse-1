@@ -77,7 +77,7 @@ pub(super) fn extension_only_modules(app: &App) -> HashSet<ClassId> {
         }
         for lc in &tm.inner_classes {
             scan.bar_ids(&lc.includes);
-            for call in lc.unknown_calls.iter().chain(lc.methods.iter().map(|m| &m.body)) {
+            for call in lc.unknown_calls.iter().chain(lc.methods.iter().map(|m| &*m.body)) {
                 scan.bar_within(call);
             }
         }

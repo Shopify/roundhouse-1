@@ -744,7 +744,7 @@ pub fn push_model_to_gid_uri(methods: &mut Vec<crate::dialect::MethodDef>, model
         name,
         receiver: crate::dialect::MethodReceiver::Instance,
         params: vec![],
-        body,
+        body: body.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),

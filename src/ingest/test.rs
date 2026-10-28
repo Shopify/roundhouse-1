@@ -552,7 +552,7 @@ fn use_transactional_tests_reader(class: &ClassId, value: bool) -> MethodDef {
         params: Vec::new(),
         unsupported_formals: None,
         has_anonymous_block: false,
-        body: Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Bool { value } }),
+        body: (Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Bool { value } })).into(),
         signature: Some(crate::lower::typing::fn_sig(vec![], crate::ty::Ty::Bool)),
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(class.0.clone()),
@@ -1031,7 +1031,7 @@ pub(super) fn ingest_test_class(
         let own_def = own.is_some();
         let name_span = match own.map(|i| helpers.remove(i)) {
             Some(m) => {
-                exprs.push(m.body);
+                exprs.push(m.body.into_expr());
                 m.name_span
             }
             None => Span::synthetic(),
@@ -1066,7 +1066,7 @@ pub(super) fn ingest_test_class(
             params: Vec::new(),
             unsupported_formals: None,
             has_anonymous_block: false,
-            body,
+            body: body.into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(name.0.clone()),
@@ -1532,7 +1532,7 @@ fn transactional_tests_method(stmt: &Node) -> Option<MethodDef> {
         has_anonymous_block: false,
         block_param: None,
         name_span: Span::synthetic(),
-        body,
+        body: body.into(),
         signature: Some(Ty::Fn {
             params: Vec::new().into(),
             block: None,

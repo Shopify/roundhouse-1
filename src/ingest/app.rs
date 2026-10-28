@@ -6088,7 +6088,7 @@ fn synthesize_template_only_actions(app: &mut App) {
                 rest_param: None,
                 anonymous_formal: None,
                 name_span: crate::span::Span::synthetic(),
-                body: method.body,
+                body: method.body.into_expr(),
                 renders: RenderTarget::Inferred,
                 effects: crate::effect::EffectSet::pure(),
             },
@@ -6443,7 +6443,7 @@ fn splice_concerns_into_controllers(app: &mut App) {
                         block_param: method.block_param.as_ref().map(|p| p.name.clone()),
                         rest_param,
                         anonymous_formal,
-                        body,
+                        body: body.into_expr(),
                         renders: RenderTarget::Inferred,
                         effects: crate::effect::EffectSet::pure(),
                     },
@@ -7882,7 +7882,7 @@ fn substitute_params(
     bindings.extend(extra);
     replace(&mut body, &bindings);
     fold_literal_hash_reads(&mut body);
-    Some(body)
+    Some(body.into_expr())
 }
 
 /// True for the call-site expression that supplies keyword arguments —
@@ -12961,7 +12961,7 @@ fn synthesize_redirect_controller(
                     rest_param: None,
                     anonymous_formal: None,
                     name_span: Span::synthetic(),
-                    body,
+                    body: body.into_expr(),
                     // The action IS the redirect, which is what the
                     // render target says.
                     renders: RenderTarget::Redirect { to: location_for_target },

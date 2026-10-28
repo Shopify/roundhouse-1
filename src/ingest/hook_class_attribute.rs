@@ -185,7 +185,7 @@ pub(super) fn expand(app: &mut App) {
         let hook = &mut app.library_classes[mi].methods[hi];
         let mut statements = match &*hook.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
-            _ => vec![hook.body.clone()],
+            _ => vec![(*hook.body).clone()],
         };
         let base = Expr::new(
             hook.body.span,
@@ -199,7 +199,7 @@ pub(super) fn expand(app: &mut App) {
             statements.splice(*at..*at + 1, seeds);
         }
         let span = hook.body.span;
-        hook.body = Expr::new(span, ExprNode::Seq { exprs: statements });
+        hook.body = (Expr::new(span, ExprNode::Seq { exprs: statements })).into();
     }
 }
 

@@ -197,7 +197,7 @@ mod tests {
                 from_kwrest: false,
             }),
             name_span: Span::synthetic(),
-            body,
+            body: body.into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: None,

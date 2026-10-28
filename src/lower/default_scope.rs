@@ -410,7 +410,7 @@ fn class_method(model: &ClassId, name: &str, params: Vec<Param>, body: Expr) -> 
         name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params,
-        body,
+        body: body.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(model.0.clone()),
@@ -581,13 +581,13 @@ fn push_chain_methods(methods: &mut Vec<MethodDef>, name: &ClassId, chains: &[Ch
             }),
             else_branch: synthetic(ExprNode::Lit { value: Literal::Nil }),
         });
-        let body = std::mem::replace(&mut delete_all.body, synthetic(ExprNode::Lit { value: Literal::Nil }));
+        let body = std::mem::replace(&mut *delete_all.body, (synthetic(ExprNode::Lit { value: Literal::Nil })).into());
         let mut exprs = vec![guard];
         match *body.node {
             ExprNode::Seq { exprs: rest } => exprs.extend(rest),
             node => exprs.push(Expr::new(body.span, node)),
         }
-        delete_all.body = synthetic(ExprNode::Seq { exprs });
+        delete_all.body = (synthetic(ExprNode::Seq { exprs })).into();
     }
 }
 

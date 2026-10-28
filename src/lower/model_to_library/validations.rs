@@ -212,7 +212,7 @@ fn take_explicit_validation_context(methods: &mut [MethodDef], model: &Model, sp
         },
     );
     let checks = validate.body.clone();
-    validate.body = Expr::new(span, ExprNode::If { cond: empty, then_branch: checks, else_branch: forward });
+    validate.body = (Expr::new(span, ExprNode::If { cond: empty, then_branch: checks.into_expr(), else_branch: forward })).into();
     validate.params = vec![crate::dialect::Param {
         name: context.clone(),
         default: None,
@@ -406,7 +406,7 @@ pub(crate) fn push_subclass_belongs_to_checks(methods: &mut Vec<MethodDef>, view
     };
     let mut stmts = match &*existing.body.node {
         ExprNode::Seq { exprs } => exprs.clone(),
-        _ => vec![existing.body.clone()],
+        _ => vec![(*existing.body).clone()],
     };
     let after_super = stmts.iter().position(|s| matches!(&*s.node, ExprNode::Super { .. })).map_or(0, |i| i + 1);
     for check in checks {
@@ -416,7 +416,7 @@ pub(crate) fn push_subclass_belongs_to_checks(methods: &mut Vec<MethodDef>, view
             .map_or(stmts.len(), |i| after_super + i);
         stmts.insert(at, check);
     }
-    existing.body = seq(stmts);
+    existing.body = seq(stmts).into();
 }
 
 pub(crate) fn validate_method_def(owner: &ClassId, stmts: Vec<Expr>) -> MethodDef {
@@ -428,7 +428,7 @@ pub(crate) fn validate_method_def(owner: &ClassId, stmts: Vec<Expr>) -> MethodDe
         name: Symbol::from("validate"),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: seq(stmts),
+        body: seq(stmts).into(),
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -1146,7 +1146,7 @@ fn push_active_model_validation_surface_for(
             name: Symbol::from(valid_name),
             receiver: MethodReceiver::Instance,
             params,
-            body,
+            body: body.into(),
             signature: Some(signature),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1203,7 +1203,7 @@ fn push_active_model_validation_surface_for(
             name: Symbol::from("invalid?"),
             receiver: MethodReceiver::Instance,
             params,
-            body,
+            body: body.into(),
             signature: Some(signature),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1285,7 +1285,7 @@ fn push_active_model_validation_surface_for(
             name: Symbol::from("validate!"),
             receiver: MethodReceiver::Instance,
             params,
-            body,
+            body: body.into(),
             signature: Some(signature),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1307,7 +1307,7 @@ fn push_active_model_validation_surface_for(
             name: Symbol::from("validation_context"),
             receiver: MethodReceiver::Instance,
             params: Vec::new(),
-            body: Expr::new(span, ExprNode::Ivar { name: Symbol::from("validation_context") }),
+            body: (Expr::new(span, ExprNode::Ivar { name: Symbol::from("validation_context") })).into(),
             signature: Some(fn_sig(vec![], Ty::Union { variants: vec![Ty::Sym, Ty::Nil].into() })),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1326,7 +1326,7 @@ fn push_active_model_validation_surface_for(
             name: Symbol::from("errors"),
             receiver: MethodReceiver::Instance,
             params: Vec::new(),
-            body: errors_reader(span, errors_readers, "errors", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+            body: (errors_reader(span, errors_readers, "errors", Ty::Array { elem: std::sync::Arc::new(Ty::Str) })).into(),
             signature: Some(fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) })),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1345,7 +1345,7 @@ fn push_active_model_validation_surface_for(
             name: Symbol::from("error_details"),
             receiver: MethodReceiver::Instance,
             params: Vec::new(),
-            body: errors_reader(span, errors_readers, "error_details", crate::lower::errors_add::error_details_ty()),
+            body: errors_reader(span, errors_readers, "error_details", crate::lower::errors_add::error_details_ty()).into(),
             signature: Some(fn_sig(vec![], crate::lower::errors_add::error_details_ty())),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -1364,7 +1364,7 @@ fn push_active_model_validation_surface_for(
             name: Symbol::from("error_messages_for"),
             receiver: MethodReceiver::Instance,
             params: vec![crate::dialect::Param::positional(Symbol::from("attribute"))],
-            body: error_messages_for_body(span, errors_readers),
+            body: error_messages_for_body(span, errors_readers).into(),
             signature: Some(fn_sig(vec![(Symbol::from("attribute"), Ty::Str)], Ty::Array { elem: std::sync::Arc::new(Ty::Str) })),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),

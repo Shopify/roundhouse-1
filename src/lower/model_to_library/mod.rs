@@ -88,7 +88,7 @@ pub(crate) fn push_synth_instance_method(
         name,
         receiver: MethodReceiver::Instance,
         params,
-        body,
+        body: body.into(),
         signature,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -2165,7 +2165,7 @@ fn build_methods_for_dialect(
         }
         if dialect == crate::lower::arel::SqlDialect::Postgres {
             if let Some(method) = methods.iter_mut().find(|method| method.name.as_str() == "_table_sql") {
-                method.body = crate::lower::typing::lit_str(dialect.ident(table.name.as_str()));
+                method.body = crate::lower::typing::lit_str(dialect.ident(table.name.as_str())).into();
             }
         }
         // Per-model Level-3 adapter primitives (`_adapter_find_by_id`, etc.)
@@ -2548,11 +2548,11 @@ pub(crate) fn push_subclass_model_methods(methods: &mut Vec<MethodDef>, view: &M
         }
         let own = match &*hook.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
-            _ => vec![hook.body.clone()],
+            _ => vec![(*hook.body).clone()],
         };
         let mut stmts = vec![Expr::new(Span::synthetic(), ExprNode::Super { args: Some(Vec::new()), block: None })];
         stmts.extend(own);
-        hook.body = seq(stmts);
+        hook.body = seq(stmts).into();
     }
     synthesized.extend(hooks);
     synthesized.extend(lifted_callbacks);
@@ -2794,7 +2794,7 @@ fn inherited_forwarder(model: &Model, old: &Symbol) -> Option<MethodDef> {
         has_anonymous_block: false,
         block_param: None,
         name_span: Span::synthetic(),
-        body: Expr::new(
+        body: (Expr::new(
             Span::synthetic(),
             ExprNode::Send {
                 recv: None,
@@ -2803,7 +2803,7 @@ fn inherited_forwarder(model: &Model, old: &Symbol) -> Option<MethodDef> {
                 block: None,
                 parenthesized: false,
             },
-        ),
+        )).into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),
@@ -3041,7 +3041,7 @@ pub(crate) fn push_scope_methods(
             name: scope.name.clone(),
             receiver: MethodReceiver::Class,
             params,
-            body,
+            body: body.into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
@@ -3200,7 +3200,7 @@ pub(crate) fn push_scope_variants(
                     name: vname,
                     receiver: MethodReceiver::Class,
                     params,
-                    body,
+                    body: body.into(),
                     signature: Some(Ty::Fn {
                         params: sig_params.into(),
                         block: None,

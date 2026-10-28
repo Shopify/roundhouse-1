@@ -183,7 +183,7 @@ pub fn transform_method(mut m: MethodDef, reg: &Registry) -> MethodDef {
     // instance methods on a typed local (`instance.save` in `create`)
     // must still destructure the `{record, value}` tuple.
     if m.receiver == MethodReceiver::Class {
-        m.body = rebind_record_calls(&m.body, reg);
+        m.body = rebind_record_calls(&m.body, reg).into();
         return m;
     }
     if !should_thread(&m) {
@@ -344,9 +344,9 @@ fn rewrite(mut m: MethodDef, reg: &Registry) -> MethodDef {
     // `record` through its `if` branches (recurse / post-value), so it
     // must NOT get a trailing `record` appended.
     m.body = if writes && !m.name.as_str().ends_with("__loop") {
-        append_record_return(body)
+        append_record_return(body).into()
     } else {
-        body
+        body.into()
     };
     m
 }
@@ -372,13 +372,13 @@ fn rewrite_dual_return(mut m: MethodDef, reg: &Registry) -> MethodDef {
             _ => vec![init],
         };
         stmts.push(tail_call);
-        m.body = syn(ExprNode::Seq { exprs: stmts });
+        m.body = (syn(ExprNode::Seq { exprs: stmts })).into();
         return m;
     }
     let body = rebind_record_calls(&body, reg);
     let body = thread_branches(&body);
     let body = wrap_returns(&body);
-    m.body = wrap_tail(&body);
+    m.body = wrap_tail(&body).into();
     m
 }
 
@@ -1291,7 +1291,7 @@ mod tests {
             receiver: MethodReceiver::Instance,
             params: params.iter().map(|p| Param::positional(sym(p))).collect(),
             block_param: None,
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,
@@ -1528,7 +1528,7 @@ mod tests {
             receiver: MethodReceiver::Instance,
             params: vec![Param::with_default(sym("other"), nil())],
             block_param: None,
-            body,
+            body: body.into(),
             signature: None,
             effects: EffectSet::pure(),
             enclosing_class: None,

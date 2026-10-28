@@ -167,7 +167,7 @@ pub(crate) fn preserve_argument_owners(app: &mut App, registry: &HashMap<ClassId
                     bridge.visibility = MethodVisibility::Public;
                     bridge.block_param = None;
                     bridge.has_anonymous_block = false;
-                    bridge.body = value.clone();
+                    bridge.body = value.clone().into();
                     bridge.effects = effects.clone();
                     let call_args = params
                         .iter()

@@ -65,7 +65,7 @@ fn synthesize_module_lc(funcs: &[LibraryFunction]) -> LibraryClass {
             name: f.name.clone(),
             receiver: MethodReceiver::Class,
             params: f.params.clone(),
-            body: f.body.clone(),
+            body: f.body.clone().into(),
             signature: f.signature.clone(),
             effects: f.effects.clone(),
             enclosing_class: Some(module_id.0.clone()),

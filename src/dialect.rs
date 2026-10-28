@@ -1577,7 +1577,7 @@ pub struct MethodDef {
     /// synthesize.
     #[serde(default, skip_serializing_if = "Span::is_synthetic")]
     pub name_span: Span,
-    pub body: Expr,
+    pub body: crate::body::Body,
     pub signature: Option<Ty>,
     pub effects: EffectSet,
     /// Class/module the method is defined under, if any. `None` for

@@ -109,7 +109,7 @@ pub mod nil_check_to_comma_ok {
     pub fn apply(mut classes: Vec<LibraryClass>) -> Vec<LibraryClass> {
         for class in classes.iter_mut() {
             for method in class.methods.iter_mut() {
-                method.body = transform(&method.body);
+                method.body = transform(&method.body).into();
             }
         }
         classes
@@ -350,7 +350,7 @@ pub mod nil_to_zero_for_string_fields {
                 continue;
             }
             for method in class.methods.iter_mut() {
-                method.body = transform(&method.body, &fields);
+                method.body = transform(&method.body, &fields).into();
             }
         }
         classes

@@ -73,7 +73,7 @@ pub fn ruby_family_absolute_test_urls(
             }
             tm.setup = tm.setup.as_ref().map(rewrite);
             for h in &mut tm.helpers {
-                h.body = rewrite(&h.body);
+                h.body = rewrite(&h.body).into();
             }
             tm
         })
@@ -278,7 +278,7 @@ pub fn lower_test_modules_with_assertions(
                 None => fixture_names.clone(),
             };
             for m in &mut lc.methods {
-                m.body = crate::lower::rewrite_fixture_calls(&m.body, &names);
+                m.body = crate::lower::rewrite_fixture_calls(&m.body, &names).into();
             }
             lc
         })
@@ -865,7 +865,7 @@ fn build_library_class(
                     }),
                 })
             } else {
-                method.body.clone()
+                (*method.body).clone()
             };
             inline_setup = Some(match inline_setup {
                 Some(callbacks) => prepend_setup(&callbacks, &body),
@@ -926,7 +926,7 @@ fn build_library_class(
             &m.body,
             &helper_shadows,
             route_id_segments,
-        );
+        ).into();
         if m.signature.is_none() {
             // KIND-AWARE, via `Param::ty_kind`. `fn_sig` makes every
             // param Required, which is right for the synthesized stubs
@@ -1037,7 +1037,7 @@ fn test_method_def(owner: &ClassId, method_name: Symbol, body: Expr) -> MethodDe
         name: method_name,
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature: Some(crate::lower::typing::fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),

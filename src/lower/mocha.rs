@@ -1261,13 +1261,13 @@ fn guard_app_methods(app: &mut App, stubbed: &BTreeMap<(String, String), BTreeSe
                 else_branch: Expr::new(sp(), ExprNode::Lit { value: Literal::Nil }),
             },
         );
-        let body = std::mem::replace(&mut def.body, Expr::new(sp(), ExprNode::Lit { value: Literal::Nil }));
+        let body = std::mem::replace(&mut *def.body, Expr::new(sp(), ExprNode::Lit { value: Literal::Nil }));
         let mut exprs = vec![bind, guard];
         match *body.node {
             ExprNode::Seq { exprs: rest } => exprs.extend(rest),
             _ => exprs.push(body),
         }
-        def.body = Expr::new(sp(), ExprNode::Seq { exprs });
+        def.body = (Expr::new(sp(), ExprNode::Seq { exprs })).into();
 
         // The writer. Typed by its signature, since this runs after
         // analysis: the slot is `MochaStub?`.
@@ -1280,13 +1280,13 @@ fn guard_app_methods(app: &mut App, stubbed: &BTreeMap<(String, String), BTreeSe
             name: Symbol::from(format!("{}=", slot.as_str())),
             receiver: MethodReceiver::Instance,
             params: vec![Param::positional(value.clone())],
-            body: Expr::new(
+            body: (Expr::new(
                 sp(),
                 ExprNode::Assign {
                     target: LValue::Ivar { name: ivar.clone() },
                     value: Expr::new(sp(), ExprNode::Var { id: crate::ident::VarId(0), name: value.clone() }),
                 },
-            ),
+            )).into(),
             signature: Some(crate::lower::typing::fn_sig(
                 vec![(value, Ty::Union { variants: vec![Ty::Class { id: ClassId(Symbol::from("MochaStub")), args: vec![].into() }, Ty::Nil].into() })],
                 Ty::Nil,

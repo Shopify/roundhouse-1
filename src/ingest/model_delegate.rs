@@ -179,7 +179,7 @@ fn included_concern_method_bodies(
                     .filter(|method| {
                         method.receiver == crate::dialect::MethodReceiver::Instance
                     })
-                    .map(|method| method.body.clone()),
+                    .map(|method| (*method.body).clone()),
             );
             pending.extend(includes.iter().cloned());
         }

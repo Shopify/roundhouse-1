@@ -193,7 +193,7 @@ pub(super) fn lower_dry_monads(app: &mut App, sources: &[crate::span::SourceFile
             }
             let span = method.body.span;
             let body = unwrap_yields(&method.body);
-            method.body = Expr::new(
+            method.body = (Expr::new(
                 span,
                 ExprNode::BeginRescue {
                     body,
@@ -218,7 +218,7 @@ pub(super) fn lower_dry_monads(app: &mut App, sources: &[crate::span::SourceFile
                     ensure: None,
                     implicit: false,
                 },
-            );
+            )).into();
         }
     }
 

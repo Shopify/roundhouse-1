@@ -168,14 +168,14 @@ pub fn app_broadcasts_live(app: &crate::app::App) -> bool {
     }
     let model_bodies = app.models.iter().flat_map(|m| {
         m.body.iter().filter_map(|item| match item {
-            ModelBodyItem::Method { method, .. } => Some(&method.body),
+            ModelBodyItem::Method { method, .. } => Some(&*method.body),
             _ => None,
         })
     });
     let library_bodies = app
         .library_classes
         .iter()
-        .flat_map(|lc| lc.methods.iter().map(|m| &m.body));
+        .flat_map(|lc| lc.methods.iter().map(|m| &*m.body));
     model_bodies.chain(library_bodies).any(is_live_broadcast_call)
 }
 
@@ -503,7 +503,7 @@ pub fn push_to_gid_param(
         name,
         receiver: crate::dialect::MethodReceiver::Instance,
         params: vec![],
-        body,
+        body: body.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),

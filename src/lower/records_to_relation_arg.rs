@@ -48,7 +48,7 @@ pub fn rewrite_test_classes(lcs: &mut [LibraryClass], app: &App) {
     }
     for lc in lcs.iter_mut() {
         for method in &mut lc.methods {
-            method.body = map_expr(&method.body, &|e| rewrite_send(e, app));
+            method.body = map_expr(&method.body, &|e| rewrite_send(e, app)).into();
         }
     }
 }

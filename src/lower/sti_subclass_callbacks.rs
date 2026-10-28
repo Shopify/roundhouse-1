@@ -251,7 +251,7 @@ fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool,
             from_keyword: false,
             from_kwrest: false,
             }],
-            body,
+            body: body.into(),
             signature: None,
             effects: crate::effect::EffectSet::default(),
             enclosing_class: Some(lc.name.0.clone()),
@@ -284,10 +284,10 @@ fn fold(lc: &mut crate::dialect::LibraryClass, hook: &str, target: &Symbol) {
     }) {
         let mut stmts = match &*existing.body.node {
             ExprNode::Seq { exprs } => exprs.clone(),
-            _ => vec![existing.body.clone()],
+            _ => vec![(*existing.body).clone()],
         };
         stmts.push(call);
-        existing.body = Expr::new(span, ExprNode::Seq { exprs: stmts });
+        existing.body = (Expr::new(span, ExprNode::Seq { exprs: stmts })).into();
         return;
     }
     lc.methods.push(crate::dialect::MethodDef {
@@ -298,7 +298,7 @@ fn fold(lc: &mut crate::dialect::LibraryClass, hook: &str, target: &Symbol) {
         name: hook,
         receiver: crate::dialect::MethodReceiver::Instance,
         params: Vec::new(),
-        body: call,
+        body: call.into(),
         signature: None,
         effects: crate::effect::EffectSet::default(),
         enclosing_class: Some(lc.name.0.clone()),

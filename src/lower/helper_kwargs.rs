@@ -105,7 +105,7 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagn
                 .setup
                 .iter_mut()
                 .chain(tm.tests.iter_mut().map(|t| &mut t.body))
-                .chain(tm.helpers.iter_mut().map(|m| &mut m.body));
+                .chain(tm.helpers.iter_mut().map(|m| &mut *m.body));
             for body in bodies {
                 rewrite_class_and_instance(body, &class_params, &instance_params, &mut diagnostics);
             }

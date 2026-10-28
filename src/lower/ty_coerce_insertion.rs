@@ -47,7 +47,7 @@ pub fn insert_ty_coercions(lcs: &mut [LibraryClass]) {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
         for method in &mut lc.methods {
-            method.body = rewrite_expr(&method.body, &registry, &class_name);
+            method.body = rewrite_expr(&method.body, &registry, &class_name).into();
         }
     }
 }
@@ -73,7 +73,7 @@ pub fn insert_ty_coercions_with_extras(
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
         for method in &mut lc.methods {
-            method.body = rewrite_expr(&method.body, &registry, &class_name);
+            method.body = rewrite_expr(&method.body, &registry, &class_name).into();
         }
     }
 }

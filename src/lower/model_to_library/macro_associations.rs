@@ -203,7 +203,7 @@ fn class_method(model: &Model, name: &str, params: Vec<Param>, body: Expr) -> Me
         name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params,
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),

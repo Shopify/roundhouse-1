@@ -202,7 +202,7 @@ fn synthesize_module_lc(
             name: f.name.clone(),
             receiver: crate::dialect::MethodReceiver::Class,
             params: f.params.clone(),
-            body: f.body.clone(),
+            body: f.body.clone().into(),
             signature: f.signature.clone(),
             effects: f.effects.clone(),
             enclosing_class: Some(module_id.0.clone()),
@@ -519,7 +519,7 @@ fn collect_imports_for_function(
             name: func.name.clone(),
             receiver: crate::dialect::MethodReceiver::Class,
             params: func.params.clone(),
-            body: func.body.clone(),
+            body: func.body.clone().into(),
             signature: func.signature.clone(),
             effects: func.effects.clone(),
             enclosing_class: Some(crate::ident::Symbol::from(

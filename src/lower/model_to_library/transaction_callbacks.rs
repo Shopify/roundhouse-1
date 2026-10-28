@@ -513,7 +513,7 @@ fn method_def(model: &Model, name: &str, receiver: MethodReceiver, body: Expr, s
         name: Symbol::from(name),
         receiver,
         params: Vec::new(),
-        body,
+        body: body.into(),
         signature,
         effects: EffectSet::default(),
         enclosing_class: Some(model.name.0.clone()),

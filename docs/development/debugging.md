@@ -89,6 +89,14 @@ ROUNDHOUSE_TIMINGS=1 ROUNDHOUSE_MEMORY_CENSUS=1 \
 exceeds `ci/memory-budget.json`. A change that lowers memory updates the
 budget with `scripts/memory-budget --record`; raising it needs a reason in
 the PR.
+
+`ROUNDHOUSE_STORE=spill` keeps library method bodies in a file (the unit
+store, `src/store.rs`) while the analysis fixpoint runs: the library pass
+writes each class's bodies there once it has typed them, and a body that
+anything reads again is decoded on that read. Output is the same either
+way; only memory and time change. The file goes in `ROUNDHOUSE_STORE_DIR`
+(the system temp directory otherwise), which must not be tmpfs.
+`ROUNDHOUSE_STORE=check` also round-trips every record as it is written.
 Other debugging controls are discoverable at their readers:
 `rg -n 'ROUNDHOUSE_' src/ scripts/`. Matches include comments and generated
 code; inspect the actual read before assuming a variable is live.

@@ -613,7 +613,7 @@ fn callees_of(index: &Index, key: &MethodKey) -> Vec<MethodKey> {
     for m in index.bodies(class, name, *class_side) {
         // A parameter's default runs in the method too.
         let defaults = m.params.iter().filter_map(|p| p.default.as_ref());
-        for body in std::iter::once(&m.body).chain(defaults) {
+        for body in std::iter::once(&*m.body).chain(defaults) {
             visit(body, &mut |e| enqueue_send(index, e, class, *class_side, key, &mut seen, &mut found));
         }
     }

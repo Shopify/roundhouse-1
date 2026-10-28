@@ -812,7 +812,7 @@ fn as_json_method(owner: &ClassId, readers: &[Symbol]) -> MethodDef {
             Symbol::from("options"),
             Expr::new(Span::synthetic(), ExprNode::Hash { entries: vec![], kwargs: false }),
         )],
-        body,
+        body: body.into(),
         signature: None,
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),

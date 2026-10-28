@@ -1846,7 +1846,7 @@ impl<'a> Scope<'a> {
             has_anonymous_block: false,
             block_param: block_param.clone().map(Param::positional),
             name_span: super::util::node_span(name_node, &self.source.path),
-            body,
+            body: body.into(),
             signature: None,
             effects: Default::default(),
             enclosing_class: Some(owner_name(self.app, self.owner).0.clone()),

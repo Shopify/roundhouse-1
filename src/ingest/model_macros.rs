@@ -589,7 +589,7 @@ fn expand_define_methods(
     }
     let statements = match &*def.body.node {
         ExprNode::Seq { exprs } => exprs.as_slice(),
-        _ => std::slice::from_ref(&def.body),
+        _ => std::slice::from_ref(&*def.body),
     };
     let mut methods: Vec<MethodDef> = Vec::new();
     for statement in statements {
@@ -661,7 +661,7 @@ fn expand_define_methods(
             let mut helpers: HashSet<Symbol> =
                 methods.iter().map(|m| m.name.clone()).collect();
             helpers.insert(name);
-            generated.body = substitute(body.clone(), &bindings, &helpers)?;
+            generated.body = substitute(body.clone(), &bindings, &helpers)?.into();
             methods.push(generated);
         } else {
             let visibility = match method.as_str() {
