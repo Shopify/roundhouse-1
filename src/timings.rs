@@ -56,8 +56,9 @@ fn rss_anon_mb() -> Option<u64> {
 
 /// The measurements after a phase's time: peak RSS, then (where the
 /// platform reports it) current anonymous RSS, then, with the
-/// `memory-census` feature, live heap bytes and their high-water mark.
-fn memory_summary() -> String {
+/// `memory-census` feature, live heap bytes, their high-water mark for
+/// the whole run, and the phase's own high-water mark (`phase peak`).
+fn memory_summary(window: &Window) -> String {
     let mut summary = match peak_rss_mb() {
         Some(mb) => format!("peak rss {mb} MB"),
         None => "peak rss unavailable".to_string(),
@@ -71,7 +72,34 @@ fn memory_summary() -> String {
         crate::memory_census::live_bytes() / 1_000_000,
         crate::memory_census::peak_bytes() / 1_000_000,
     ));
+    #[cfg(feature = "memory-census")]
+    summary.push_str(&format!(", phase peak {} MB", crate::memory_census::close_window(window.id) / 1_000_000));
+    #[cfg(not(feature = "memory-census"))]
+    let _ = window;
     summary
+}
+
+/// The span a phase's own heap peak is measured over. With the
+/// `memory-census` feature it is a window of the counting allocator,
+/// closed when the line prints; otherwise it measures nothing.
+struct Window {
+    #[cfg(feature = "memory-census")]
+    id: u64,
+}
+
+impl Window {
+    fn open() -> Self {
+        Window {
+            #[cfg(feature = "memory-census")]
+            id: crate::memory_census::open_window(),
+        }
+    }
+
+    /// Stop measuring without printing, for a lap that never ends.
+    fn discard(self) {
+        #[cfg(feature = "memory-census")]
+        crate::memory_census::close_window(self.id);
+    }
 }
 
 /// Run a phase and print measurements only when requested.
@@ -93,6 +121,7 @@ pub fn begin(name: impl std::fmt::Display) -> Option<Guard> {
     Some(Guard {
         name: name.to_string(),
         start: Instant::now(),
+        window: Window::open(),
     })
 }
 
@@ -105,13 +134,16 @@ pub fn note(msg: impl std::fmt::Display) {
 }
 
 thread_local! {
-    static LAP: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static LAP: std::cell::RefCell<Option<(Instant, Window)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Start a run of laps: the next `lap` measures from here.
 pub fn lap_start() {
     if *ENABLED {
-        LAP.with(|lap| lap.set(Some(Instant::now())));
+        let previous = LAP.with(|lap| lap.replace(Some((Instant::now(), Window::open()))));
+        if let Some((_, window)) = previous {
+            window.discard();
+        }
     }
 }
 
@@ -121,16 +153,18 @@ pub fn lap(name: impl std::fmt::Display) {
     if !*ENABLED {
         return;
     }
-    let now = Instant::now();
-    if let Some(start) = LAP.with(|lap| lap.replace(Some(now))) {
-        drop(Guard { name: name.to_string(), start });
+    let previous = LAP.with(|lap| lap.take());
+    if let Some((start, window)) = previous {
+        drop(Guard { name: name.to_string(), start, window });
     }
+    LAP.with(|lap| *lap.borrow_mut() = Some((Instant::now(), Window::open())));
 }
 
 /// Prints one `roundhouse-timing:` line on drop.
 pub struct Guard {
     name: String,
     start: Instant,
+    window: Window,
 }
 
 impl Drop for Guard {
@@ -139,7 +173,7 @@ impl Drop for Guard {
             "roundhouse-timing: {}: {:.2}s ({})",
             self.name,
             self.start.elapsed().as_secs_f64(),
-            memory_summary(),
+            memory_summary(&self.window),
         );
     }
 }
