@@ -163,3 +163,27 @@ fn runs_like_native() {
     assert!(run.success, "stdout={}\nstderr={}", run.stdout, run.stderr);
     assert_eq!(run.stdout, native_out, "stderr={}", run.stderr);
 }
+
+/// No extension facts, and opentelemetry-api only in the lock: the tree's
+/// gem_facades.rb requires "opentelemetry" whenever the lock pins it
+/// (`project::open_telemetry_require`), so the gem is loaded and the
+/// authored value runs. Before, the gem counted as loaded only through a
+/// project extension's lock-gated gem, and the assignment compiled to
+/// `raise "roundhouse: declared type not supported"`, which raised as
+/// boot loaded the initializer's constant.
+#[test]
+fn the_tree_s_own_opentelemetry_require_loads_the_gem() {
+    let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    opentelemetry-api (1.10.1)\n\nDEPENDENCIES\n  opentelemetry-api\n";
+    let (dir, errors) = emit_and_run::empty_app()
+        .write("Gemfile.lock", lock)
+        .write("sorbet/rbi/gems/opentelemetry-api@1.10.1.rbi", OTEL_RBI)
+        .write("config/initializers/00_tracing.rb", TRACING)
+        .write("app/models/traced.rb", READER)
+        .emit(BuildTarget::Ruby);
+    let named = declared_type_errors(&errors);
+    assert_eq!(named.len(), 1, "{errors:#?}");
+    assert!(named[0].contains("the CRuby tree loads opentelemetry-api natively, so the value runs"), "{}", named[0]);
+    let tracer = std::fs::read_to_string(dir.join("app/models/tracer.rb")).expect("tracer.rb");
+    assert!(!tracer.contains("raise"), "{tracer}");
+    assert!(tracer.trim().ends_with("\nTRACER = OpenTelemetry.tracer_provider.tracer(\"Shopify\")"), "{tracer}");
+}
