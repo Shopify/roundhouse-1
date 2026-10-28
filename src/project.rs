@@ -16944,23 +16944,26 @@ fn apply_git_gem_load_paths(
     unless (File.expand_path(loaded.full_gem_path) + File::SEPARATOR).start_with?(root)
       raise LoadError, "roundhouse: git gem #{name} (#{remote} at #{revision}) is already loaded from #{loaded.full_gem_path}, not #{directory}"
     end
-    next
+    # Activated already (`bundle exec` set the load path up from the
+    # Gemfile): Rails' components still come off $LOAD_PATH below.
+    spec = loaded
+  else
+    spec = Dir[File.join(directory, glob)].filter_map { |file| Gem::Specification.load(file) }.find { |candidate| candidate.name == name }
+    unless spec
+      raise LoadError, "roundhouse: git gem #{name} (#{remote} at #{revision}) has no gemspec in #{directory}"
+    end
+    spec.full_gem_path = File.dirname(spec.loaded_from)
+    # Where Bundler builds a git gem's extensions
+    # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).
+    spec.extension_dir = File.join(File.dirname(directory), "extensions", Gem::Platform.local.to_s,
+      Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join("-"))
+    spec.activate
   end
-  spec = Dir[File.join(directory, glob)].filter_map { |file| Gem::Specification.load(file) }.find { |candidate| candidate.name == name }
-  unless spec
-    raise LoadError, "roundhouse: git gem #{name} (#{remote} at #{revision}) has no gemspec in #{directory}"
-  end
-  spec.full_gem_path = File.dirname(spec.loaded_from)
-  # Where Bundler builds a git gem's extensions
-  # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).
-  spec.extension_dir = File.join(File.dirname(directory), "extensions", Gem::Platform.local.to_s,
-    Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join("-"))
-  spec.activate
   # Rails' own components are activated, so a gem that depends on one
   # resolves, but their files are taken off $LOAD_PATH: Rails' code cannot
   # run over this tree's runtime ports (the ports answer for Rails). A
   # gem's optional Rails integration then sees a LoadError, as it would
-  # without Rails.
+  # without Rails. Under Bundler too, which has put them there itself.
   next unless "##);
     body.push_str(RAILS_REPOSITORY_GEMS_RUBY);
     body.push_str(r##".include?(name)
