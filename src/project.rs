@@ -1563,6 +1563,111 @@ fn apply_file_load_hooks(files: &mut Vec<(String, String)>, app: &App) -> Result
     Ok(())
 }
 
+/// The gem boundary of the PostgreSQL CRuby tree (`apply_postgres_bootstrap`)
+/// on the other CRuby trees, for an app whose gems the tree loads natively
+/// from its lock (Bundler.require entries, lock-gated requires, gem
+/// sources). Rails has loaded `rails`, Rails::Railtie and the framework
+/// railties before any gem, so a gem's `require "active_record"` is a
+/// no-op and its `require "x/railtie" if defined?(::Rails)` subclasses
+/// Rails::Railtie. Without the boundary the first resolved the gem home's
+/// activerecord over the runtime's (Arel's `superclass mismatch for class
+/// SelectManager`), and the second raised NameError for Rails::Railtie.
+///
+/// So, as on the PostgreSQL tree: runtime/features goes first on the load
+/// path, answering each Rails feature the tree ports from its ports
+/// (`framework_feature_files`) and `rails` / `rails/railtie` from the
+/// Rails::Railtie port, and any other Rails feature is refused by name
+/// (`framework_feature_refusal`). Rails::Railtie loads before the gems,
+/// and boot runs the railties' initializers where Application#initialize!
+/// does: the `:boot` phase before eager loading, the `:finish` phase
+/// (Finisher's, which eager loads) at the end of boot.rb.
+///
+/// Rails::Engine stays the PostgreSQL tree's: the app's own engines are
+/// dropped on every other tree (`lower::unported_rails_subclasses`), and
+/// `require "rails/engine"` is refused by name.
+fn apply_native_gem_boundary(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
+    let native_gems = !bundler_required_runtime_gems(&app.bundler_gems, app.gem_lock.as_ref(), &app.extensions).is_empty()
+        || !lock_gated_requires(app).is_empty()
+        || !gem_source_entries(app).is_empty();
+    if !native_gems {
+        return Ok(());
+    }
+    for port in ["active_support_lazy_load_hooks", "active_support_ordered_options", "rails_railtie"] {
+        let path = format!("runtime/{port}.rb");
+        if !files.iter().any(|(p, _)| *p == path) {
+            let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+                .map_err(|e| format!("read {port} runtime: {e}"))?;
+            files.push((path, text));
+        }
+    }
+    files.push((
+        "runtime/features/rails.rb".into(),
+        "# `require \"rails\"` on this tree: railties' Rails, the runtime ports\n\
+         # (runtime/rails.rb, loaded by boot.rb) with Rails::Railtie\n\
+         # (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this directory\n\
+         # first on the load path.\n\
+         require_relative \"../rails_railtie\"\n"
+            .into(),
+    ));
+    files.push((
+        "runtime/features/rails/railtie.rb".into(),
+        "# `require \"rails/railtie\"` on this tree: railties' Rails::Railtie,\n\
+         # ported (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this\n\
+         # directory first on the load path.\n\
+         require_relative \"../../rails_railtie\"\n"
+            .into(),
+    ));
+    framework_feature_files(files);
+    files.push(("runtime/framework_feature_refusal.rb".into(), framework_feature_refusal()));
+    let (_, facades) = files
+        .iter_mut()
+        .find(|(p, _)| p == "runtime/gem_facades.rb")
+        .ok_or("native gem boundary: the tree has no runtime/gem_facades.rb")?;
+    let configuration = "require_relative \"rails_configuration\"\n";
+    let at = facades.find(configuration).ok_or("native gem boundary: missing rails_configuration require in gem_facades.rb")?
+        + configuration.len();
+    facades.insert_str(
+        at,
+        "# Rails::Railtie, which `require \"rails\"` defines before Bundler.require:\n\
+         # a gem's railtie subclasses it as the gem loads.\n\
+         require_relative \"rails_railtie\"\n",
+    );
+    facades.insert_str(
+        0,
+        "require_relative \"active_support_lazy_load_hooks\"\n\
+         # A gem's Rails features answer from the runtime ports (runtime/features).\n\
+         $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n\
+         # Any other Rails feature is refused by name (project.rs::framework_feature_refusal).\n\
+         require_relative \"framework_feature_refusal\"\n",
+    );
+    let (_, models) = files
+        .iter_mut()
+        .find(|(p, _)| p == "app/models.rb")
+        .ok_or("native gem boundary: the tree has no app/models.rb")?;
+    let eager = "RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n";
+    let at = models.rfind(eager).ok_or("native gem boundary: missing eager load in app/models.rb")?;
+    models.replace_range(
+        at..at + eager.len(),
+        "# Application#initialize!: the railties' initializers, in Rails' order\n\
+         # (runtime/rails_railtie.rb). Finisher's part, which eager loads\n\
+         # (`config.eager_load`), runs at the end of boot.rb.\n\
+         Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)\n",
+    );
+    let (_, boot) = files
+        .iter_mut()
+        .find(|(p, _)| p == "boot.rb")
+        .ok_or("native gem boundary: the tree has no boot.rb")?;
+    if !boot.ends_with('\n') {
+        boot.push('\n');
+    }
+    boot.push_str(
+        "# Application#initialize!'s Finisher (to_prepare, eager loading,\n\
+         # after_initialize), after the app's code.\n\
+         Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)\n",
+    );
+    Ok(())
+}
+
 /// An `ActiveStorage::FixtureSet.blob` row loads by reading the file
 /// under `test/fixtures/files` and uploading it to a storage service.
 /// Only the ruby family has one (`runtime/spinel/active_storage_disk.rb`);
@@ -5071,6 +5176,7 @@ fn ruby_family_files(
         files.retain(|(p, _)| p != "runtime/active_record_postgresql_adapter.rb");
         if flavor == RubyFlavor::CRuby {
             apply_file_load_hooks(&mut files, app)?;
+            apply_native_gem_boundary(&mut files, app)?;
         }
     }
     apply_initializer_constants(&mut files, app)?;
