@@ -1369,6 +1369,10 @@ pub fn emit_with_assertions(
             true,
             &answered,
         );
+        // The url-rewritten copy of every test module is lowering input
+        // only. It is as large as the lowered classes, so free it before
+        // the passes below rather than holding both to the end of emit.
+        drop(test_modules);
         // A test body writes the same relation chains an app body does —
         // `@room.messages.ordered`, `user.push_subscriptions.find_by(…)`,
         // `room.memberships.grant_to(users)`. The has_many reader hands
@@ -1390,12 +1394,16 @@ pub fn emit_with_assertions(
         // half (scope-method synthesis, `push_scope_variants`) is inert
         // here and only the call-site rewrite runs.
         {
-            let mut test_lcs: Vec<crate::dialect::LibraryClass> = test_lowered
-                .iter()
-                .flat_map(|m| {
-                    std::iter::once(m.test_class.clone()).chain(m.inner_classes.iter().cloned())
-                })
-                .collect();
+            // Moved out, not cloned: a copy of every lowered test class
+            // doubled the heap's largest holding for these passes.
+            let inner_counts: Vec<usize> = test_lowered.iter().map(|m| m.inner_classes.len()).collect();
+            let mut constants = Vec::with_capacity(test_lowered.len());
+            let mut test_lcs: Vec<crate::dialect::LibraryClass> = Vec::new();
+            for m in test_lowered.drain(..) {
+                test_lcs.push(m.test_class);
+                test_lcs.extend(m.inner_classes);
+                constants.push(m.constants);
+            }
             // A record Array at a Relation-typed parameter, restated as
             // the Relation over those records — BEFORE the scope
             // lowering, which is what turns the `M.where` it writes
@@ -1425,12 +1433,15 @@ pub fn emit_with_assertions(
                 library::RootingScope::AppAndRuntime,
             );
             let mut it = test_lcs.into_iter();
-            for m in &mut test_lowered {
-                m.test_class = it.next().expect("one lowered class per test module");
-                for inner in &mut m.inner_classes {
-                    *inner = it.next().expect("one lowered class per inner class");
-                }
-            }
+            test_lowered = constants
+                .into_iter()
+                .zip(inner_counts)
+                .map(|(constants, inner_count)| crate::lower::test_module_to_library::LoweredTestModule {
+                    test_class: it.next().expect("one lowered class per test module"),
+                    inner_classes: it.by_ref().take(inner_count).collect(),
+                    constants,
+                })
+                .collect();
         }
         // Fixture classes (`ArticlesFixtures`, etc.) live at
         // `test/fixtures/<plural>.rb` — outside the model/controller
