@@ -92,5 +92,7 @@ fn an_include_naming_no_namespace_stays_refused() {
     let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
     roundhouse::session::analyze_and_lower(&mut app);
     let errors: Vec<String> = roundhouse::analyze::diagnose(&app).into_iter().map(|d| d.to_string()).collect();
-    assert!(errors.iter().any(|e| e.contains("includes unresolved Inner::Nowhere")), "{errors:?}");
+    // `Inner` binds lexically to `Outer::Inner`, so the refusal names the
+    // path Ruby would look `Nowhere` up in.
+    assert!(errors.iter().any(|e| e.contains("includes unresolved Outer::Inner::Nowhere")), "{errors:?}");
 }
