@@ -56,28 +56,26 @@ pub struct LoweredTestModule {
 /// alone, as is one a parent test class or an included helper module
 /// defines (`answered`: `shadowed_fixture_accessors`, the instance methods
 /// the class answers).
+///
+/// One module at a time: the lowering asks for it as it reaches each
+/// module (`lower_test_modules_with_assertions`' `absolute_test_urls`),
+/// so a rewritten copy of the whole suite is never held at once.
 pub fn ruby_family_absolute_test_urls(
-    modules: &[TestModule],
+    tm: &TestModule,
     answered: &crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>,
-) -> Vec<TestModule> {
-    modules
-        .iter()
-        .map(|tm| {
-            let mut shadows: std::collections::HashSet<Symbol> =
-                tm.helpers.iter().map(|h| h.name.clone()).collect();
-            shadows.extend(answered.get(&tm.name).into_iter().flatten().cloned());
-            let rewrite = |e: &Expr| absolute_test_url(e, &shadows);
-            let mut tm = tm.clone();
-            for t in &mut tm.tests {
-                t.body = rewrite(&t.body);
-            }
-            tm.setup = tm.setup.as_ref().map(rewrite);
-            for h in &mut tm.helpers {
-                h.body = rewrite(&h.body).into();
-            }
-            tm
-        })
-        .collect()
+) -> TestModule {
+    let mut shadows: std::collections::HashSet<Symbol> = tm.helpers.iter().map(|h| h.name.clone()).collect();
+    shadows.extend(answered.get(&tm.name).into_iter().flatten().cloned());
+    let rewrite = |e: &Expr| absolute_test_url(e, &shadows);
+    let mut tm = tm.clone();
+    for t in &mut tm.tests {
+        t.body = rewrite(&t.body);
+    }
+    tm.setup = tm.setup.as_ref().map(rewrite);
+    for h in &mut tm.helpers {
+        h.body = rewrite(&h.body).into();
+    }
+    tm
 }
 
 fn absolute_test_url(expr: &Expr, shadows: &std::collections::HashSet<Symbol>) -> Expr {
@@ -152,7 +150,7 @@ pub fn lower_test_modules_with_inner(
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Vec<LoweredTestModule> {
     lower_test_modules_with_assertions(test_modules, fixtures, models, extras, route_id_segments,
-        inline_assertions::AssertionMode::Inline, false, false, &crate::det::HashMap::default())
+        inline_assertions::AssertionMode::Inline, false, false, &crate::det::HashMap::default(), false)
 }
 
 /// `lower_test_modules_with_inner`, with `owner_objects` for the Ruby
@@ -167,13 +165,16 @@ pub fn lower_test_modules_with_inner_opts(
     owner_objects: bool,
 ) -> Vec<LoweredTestModule> {
     lower_test_modules_with_assertions(test_modules, fixtures, models, extras, route_id_segments,
-        inline_assertions::AssertionMode::Inline, false, owner_objects, &crate::det::HashMap::default())
+        inline_assertions::AssertionMode::Inline, false, owner_objects, &crate::det::HashMap::default(), false)
 }
 
 /// `join_association_targets`: the tree's has_many readers keep what
 /// they load, so a record created through an association joins the
 /// owner's target (`seeds_to_library::rewrite_assoc_create_with_models_in_place`).
 /// `owner_objects`: see `lower_test_modules_with_inner_opts`.
+/// `absolute_test_urls`: lower each module's bodies through
+/// `ruby_family_absolute_test_urls`, with `shadowed_fixture_accessors` as
+/// the names each class answers (the Ruby family's test emit).
 pub fn lower_test_modules_with_assertions(
     test_modules: &[TestModule],
     fixtures: &[Fixture],
@@ -184,6 +185,7 @@ pub fn lower_test_modules_with_assertions(
     join_association_targets: bool,
     owner_objects: bool,
     shadowed_fixture_accessors: &crate::det::HashMap<ClassId, crate::det::HashSet<Symbol>>,
+    absolute_test_urls: bool,
 ) -> Vec<LoweredTestModule> {
     let mut classes: HashMap<ClassId, ClassInfo> = HashMap::default();
     for (id, info) in extras {
@@ -268,9 +270,17 @@ pub fn lower_test_modules_with_assertions(
     let fixture_names: Vec<crate::ident::Symbol> =
         fixtures.iter().map(|f| f.name.clone()).collect();
     let mut out: Vec<LoweredTestModule> = Vec::new();
+    // The bodies this lowering reads, in the form it lowers them: the
+    // keyword arguments they pass, gathered here, and the library classes
+    // built from them. A module rewritten for absolute `_url`s is made,
+    // read and dropped here, one at a time.
+    let mut passed: HashMap<(Symbol, Symbol), Vec<Expr>> = HashMap::default();
     let mut all_lcs: Vec<LibraryClass> = test_modules
         .iter()
         .map(|tm| {
+            let rewritten = absolute_test_urls.then(|| ruby_family_absolute_test_urls(tm, shadowed_fixture_accessors));
+            let tm = rewritten.as_ref().unwrap_or(tm);
+            collect_keyword_args_passed(tm, &mut passed);
             let mut lc = build_library_class(tm, shadowed_fixture_accessors.get(&tm.name), route_id_segments, assertion_mode);
             // A name the class answers itself is no fixture reader here.
             let names: Vec<Symbol> = match shadowed_fixture_accessors.get(&tm.name) {
@@ -347,7 +357,6 @@ pub fn lower_test_modules_with_assertions(
     // Across every module, not per module: an included test helper is
     // carried into each test that includes it, and its `.rbs` sidecar is
     // one file by class name, so every copy has to declare the same thing.
-    let passed = keyword_args_passed(test_modules);
     let mut typed_inner_per_module: Vec<Vec<LibraryClass>> = inner_classes_per_module
         .into_iter()
         .map(|inners| {
@@ -738,12 +747,12 @@ fn signature_from_params(
     }
 }
 
-/// The literal keyword arguments the test modules' own code passes, by
-/// (method name, keyword): `hung_up?(within: 0.1)` files `0.1` under
+/// The literal keyword arguments a test module's own code passes, added
+/// to `out` by (method name, keyword): `hung_up?(within: 0.1)` files `0.1` under
 /// `(hung_up?, within)`. Tests, setup, helpers and the inner classes'
 /// own bodies are read; receivers are not resolved, so a name shared by
 /// two inner classes collects both callers' values.
-fn keyword_args_passed(modules: &[TestModule]) -> HashMap<(Symbol, Symbol), Vec<Expr>> {
+fn collect_keyword_args_passed(tm: &TestModule, out: &mut HashMap<(Symbol, Symbol), Vec<Expr>>) {
     fn walk(e: &Expr, out: &mut HashMap<(Symbol, Symbol), Vec<Expr>>) {
         if let ExprNode::Send { method, args, .. } = &*e.node {
             if let Some(last) = args.last() {
@@ -758,24 +767,20 @@ fn keyword_args_passed(modules: &[TestModule]) -> HashMap<(Symbol, Symbol), Vec<
         }
         e.node.for_each_child(&mut |c| walk(c, out));
     }
-    let mut out = HashMap::default();
-    for tm in modules {
-        for t in &tm.tests {
-            walk(&t.body, &mut out);
-        }
-        if let Some(setup) = &tm.setup {
-            walk(setup, &mut out);
-        }
-        for h in &tm.helpers {
-            walk(&h.body, &mut out);
-        }
-        for inner in &tm.inner_classes {
-            for m in &inner.methods {
-                walk(&m.body, &mut out);
-            }
+    for t in &tm.tests {
+        walk(&t.body, out);
+    }
+    if let Some(setup) = &tm.setup {
+        walk(setup, out);
+    }
+    for h in &tm.helpers {
+        walk(&h.body, out);
+    }
+    for inner in &tm.inner_classes {
+        for m in &inner.methods {
+            walk(&m.body, out);
         }
     }
-    out
 }
 
 /// Type a standalone expression (e.g. a parameter default) against the

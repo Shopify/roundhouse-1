@@ -1352,10 +1352,8 @@ pub fn emit_with_assertions(
         // A test body's `_url` answers absolute, on the session's host,
         // as the Ruby family's jbuilder `_url` does (see the pass).
         let answered = crate::lower::shadowed_fixture_accessors(&app.test_modules, &app.library_classes);
-        let test_modules =
-            crate::lower::test_module_to_library::ruby_family_absolute_test_urls(&app.test_modules, &answered);
         let mut test_lowered = crate::lower::test_module_to_library::lower_test_modules_with_assertions(
-            &test_modules,
+            &app.test_modules,
             &app.fixtures,
             &app.models,
             fixture_extras,
@@ -1368,11 +1366,9 @@ pub fn emit_with_assertions(
             // automatic inverse.
             true,
             &answered,
+            // Absolute test `_url`s, rewritten module by module.
+            true,
         );
-        // The url-rewritten copy of every test module is lowering input
-        // only. It is as large as the lowered classes, so free it before
-        // the passes below rather than holding both to the end of emit.
-        drop(test_modules);
         // A test body writes the same relation chains an app body does —
         // `@room.messages.ordered`, `user.push_subscriptions.find_by(…)`,
         // `room.memberships.grant_to(users)`. The has_many reader hands
