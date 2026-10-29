@@ -6,7 +6,8 @@
 # deprecator.rb) and railties' `Rails.deprecator` (rails/deprecator.rb)
 # and `Rails.application.deprecators` (rails/application.rb:248), ported
 # over this tree's runtime. `require "active_support"` loads the class
-# before any app code, as boot.rb loads this file.
+# before Bundler.require, as runtime/gem_facades.rb loads this file before
+# the gems.
 #
 # A gem builds its own deprecator at load (`ActiveSupport::Deprecation.new
 # ("5.0.0", "ShopifyI18n")`), registers it (`app.deprecators[:hedwig] =

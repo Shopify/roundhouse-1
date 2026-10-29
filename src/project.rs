@@ -5641,6 +5641,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let deprecation = crate::runtime_files::read_to_string("runtime/spinel/active_support_deprecation.rb")
         .map_err(|e| format!("read deprecation runtime: {e}"))?;
     files.push(("runtime/active_support_deprecation.rb".into(), deprecation));
+    // ActiveSupport::Autoload (8.2.0.alpha dependencies/autoload.rb), which
+    // `require "active_support"` defines before Bundler.require.
+    let autoload = crate::runtime_files::read_to_string("runtime/spinel/active_support_dependencies_autoload.rb")
+        .map_err(|e| format!("read Active Support autoload runtime: {e}"))?;
+    files.push(("runtime/active_support_dependencies_autoload.rb".into(), autoload));
     let deprecation_behavior = deprecation_behavior_block(app);
     let query_log_tags = query_log_tags_block(app);
     let active_job_config = active_job_config_block(app);
@@ -5897,8 +5902,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // time.rb), BigDecimal#to_s (core_ext/big_decimal/conversions.rb) and
     // File.atomic_write (core_ext/file/atomic.rb), Digest::UUID
     // (core_ext/digest/uuid.rb) and SecureRandom.base58/.base36/.base32
-    // (core_ext/securerandom.rb): a native gem's require of one answers
-    // from runtime/features.
+    // (core_ext/securerandom.rb), Array's and Enumerable's access and
+    // filtering methods (core_ext/array/access.rb, array/wrap.rb,
+    // enumerable.rb), String's filters (core_ext/string/filters.rb) and
+    // ActiveSupport::Delegation with Module#delegate_missing_to
+    // (delegation.rb, core_ext/module/delegation.rb), and
+    // ActiveSupport::CurrentAttributes (current_attributes.rb) over
+    // ActiveSupport::Callbacks and CodeGenerator: a native gem's require of
+    // one answers from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
         "active_support_module_attribute_accessors", "active_support_module_introspection", "active_support_module_anonymous", "active_support_redefine_method", "active_support_remove_method",
@@ -5906,7 +5917,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
         "active_support_time_change", "active_support_time_zone", "active_support_time_with_zone",
         "active_support_kernel_reporting", "active_support_file_atomic", "active_support_digest_uuid",
-        "active_support_securerandom",
+        "active_support_securerandom", "active_support_array_access", "active_support_array_wrap",
+        "active_support_enumerable", "active_support_string_filters", "active_support_delegation",
+        "active_support_callbacks", "active_support_code_generator", "active_support_current_attributes",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -6040,6 +6053,20 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let delegate = "require_relative \"module_delegate\"\n";
             let at = content.find(delegate).ok_or("PostgreSQL bootstrap: missing module_delegate require in gem_facades.rb")? + delegate.len();
             content.insert_str(at, "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n");
+            // Then what active_support.rb itself requires before
+            // Bundler.require: ActiveSupport::Autoload, the deprecator and
+            // ActiveSupport::Logger. A gem extends the first, builds its own
+            // deprecator with the second (`ActiveSupport::Deprecation.new`) and
+            // subclasses the third as it loads; boot.rb's later require of the
+            // deprecation port is then a no-op.
+            let inflector = "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n";
+            let early = at + inflector.len();
+            content.insert_str(
+                early,
+                "require_relative \"active_support_dependencies_autoload\"\n\
+                 require_relative \"active_support_deprecation\"\n\
+                 require_relative \"active_support_logger\"\n",
+            );
             // active_support/i18n.rb, which active_support/railtie loads
             // with `require "rails"`: after the Inflector, whose
             // `ordinal` reads the locale it adds. Then ActiveModel's
@@ -6701,6 +6728,24 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/object/try", &["active_support_tryable"]),
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
     ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
+    ("active_support/dependencies/autoload", &["active_support_dependencies_autoload"]),
+    ("active_support/current_attributes", &["active_support_current_attributes"]),
+    ("active_support/callbacks", &["active_support_callbacks"]),
+    ("active_support/code_generator", &["active_support_code_generator"]),
+    ("active_support/execution_context", &["active_support_reporters"]),
+    ("active_support/deprecation", &["active_support_deprecation"]),
+    ("active_support/deprecator", &["active_support_deprecation"]),
+    ("active_support/core_ext/string/filters", &["active_support_string_filters"]),
+    ("active_support/core_ext/array/access", &["active_support_array_access"]),
+    ("active_support/core_ext/array/wrap", &["active_support_array_wrap"]),
+    ("active_support/core_ext/enumerable", &["active_support_enumerable"]),
+    ("active_support/core_ext/module/delegation", &["active_support_delegation"]),
+    ("active_support/delegation", &["active_support_delegation"]),
+    // The tree's HashWithIndifferentAccess (Rails' class, ported in
+    // runtime/active_support_core_ext.rb) and the Hash#with_indifferent_access
+    // that core_ext/hash/indifferent_access.rb adds.
+    ("active_support/core_ext/hash/indifferent_access", &["active_support_core_ext"]),
+    ("active_support/hash_with_indifferent_access", &["active_support_core_ext"]),
     ("active_support/core_ext/kernel/reporting", &["active_support_kernel_reporting"]),
     ("active_support/core_ext/file/atomic", &["active_support_file_atomic"]),
     ("active_support/core_ext/digest/uuid", &["active_support_digest_uuid"]),
@@ -15121,6 +15166,14 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_concern.rb"
         && p != "runtime/active_support_hash_keys.rb"
         && p != "runtime/active_support_string_strip.rb"
+        && p != "runtime/active_support_dependencies_autoload.rb"
+        && p != "runtime/active_support_code_generator.rb"
+        && p != "runtime/active_support_current_attributes.rb"
+        && p != "runtime/active_support_string_filters.rb"
+        && p != "runtime/active_support_array_access.rb"
+        && p != "runtime/active_support_array_wrap.rb"
+        && p != "runtime/active_support_enumerable.rb"
+        && p != "runtime/active_support_delegation.rb"
         && p != "runtime/active_support_kernel_reporting.rb"
         && p != "runtime/active_support_file_atomic.rb"
         && p != "runtime/active_support_digest_uuid.rb"
