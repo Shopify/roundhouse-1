@@ -69,13 +69,27 @@ pub(crate) fn postgresql_test_ruby_sources() -> impl Iterator<Item = (&'static s
         .map(|(path, text)| (*path, *text))
 }
 
-/// Real framework and shim declarations, without tests or emit scaffolds.
+/// Ports the PostgreSQL bootstrap carries for the native gems that tree
+/// loads, answering their requires (`project::FRAMEWORK_FEATURE_PORTS`),
+/// not for app code: Rubydex does not index them, so an app's read of a
+/// name only they declare stays unresolved, and refused, on every target.
+pub(crate) const GEM_FACING_PORTS: &[&str] = &[
+    "runtime/spinel/active_support_array_access.rb",
+    "runtime/spinel/active_support_array_wrap.rb",
+    "runtime/spinel/active_support_string_filters.rb",
+    "runtime/spinel/active_support_enumerable.rb",
+    "runtime/spinel/active_support_delegation.rb",
+];
+
+/// Real framework and shim declarations, without tests, emit scaffolds or
+/// the gem-facing ports.
 pub(crate) fn ruby_sources() -> impl Iterator<Item = (&'static str, &'static str)> {
     FILES
         .iter()
         .filter(|(path, _)| {
             (path.starts_with("runtime/ruby/") || path.starts_with("runtime/spinel/"))
                 && path.ends_with(".rb")
+                && !GEM_FACING_PORTS.contains(path)
                 && !path
                     .split('/')
                     .any(|part| part == "test" || part == "scaffold")

@@ -5897,8 +5897,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // time.rb), BigDecimal#to_s (core_ext/big_decimal/conversions.rb) and
     // File.atomic_write (core_ext/file/atomic.rb), Digest::UUID
     // (core_ext/digest/uuid.rb) and SecureRandom.base58/.base36/.base32
-    // (core_ext/securerandom.rb): a native gem's require of one answers
-    // from runtime/features.
+    // (core_ext/securerandom.rb), Array's and Enumerable's access and
+    // filtering methods (core_ext/array/access.rb, array/wrap.rb,
+    // enumerable.rb), String's filters (core_ext/string/filters.rb) and
+    // ActiveSupport::Delegation with Module#delegate_missing_to
+    // (delegation.rb, core_ext/module/delegation.rb): a native gem's
+    // require of one answers from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
         "active_support_module_attribute_accessors", "active_support_module_introspection", "active_support_module_anonymous", "active_support_redefine_method", "active_support_remove_method",
@@ -5906,7 +5910,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
         "active_support_time_change", "active_support_time_zone", "active_support_time_with_zone",
         "active_support_kernel_reporting", "active_support_file_atomic", "active_support_digest_uuid",
-        "active_support_securerandom",
+        "active_support_securerandom", "active_support_array_access", "active_support_array_wrap",
+        "active_support_enumerable", "active_support_string_filters", "active_support_delegation",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -6701,6 +6706,17 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/object/try", &["active_support_tryable"]),
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
     ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
+    ("active_support/core_ext/string/filters", &["active_support_string_filters"]),
+    ("active_support/core_ext/array/access", &["active_support_array_access"]),
+    ("active_support/core_ext/array/wrap", &["active_support_array_wrap"]),
+    ("active_support/core_ext/enumerable", &["active_support_enumerable"]),
+    ("active_support/core_ext/module/delegation", &["active_support_delegation"]),
+    ("active_support/delegation", &["active_support_delegation"]),
+    // The tree's HashWithIndifferentAccess (Rails' class, ported in
+    // runtime/active_support_core_ext.rb) and the Hash#with_indifferent_access
+    // that core_ext/hash/indifferent_access.rb adds.
+    ("active_support/core_ext/hash/indifferent_access", &["active_support_core_ext"]),
+    ("active_support/hash_with_indifferent_access", &["active_support_core_ext"]),
     ("active_support/core_ext/kernel/reporting", &["active_support_kernel_reporting"]),
     ("active_support/core_ext/file/atomic", &["active_support_file_atomic"]),
     ("active_support/core_ext/digest/uuid", &["active_support_digest_uuid"]),
@@ -15121,6 +15137,11 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_concern.rb"
         && p != "runtime/active_support_hash_keys.rb"
         && p != "runtime/active_support_string_strip.rb"
+        && p != "runtime/active_support_string_filters.rb"
+        && p != "runtime/active_support_array_access.rb"
+        && p != "runtime/active_support_array_wrap.rb"
+        && p != "runtime/active_support_enumerable.rb"
+        && p != "runtime/active_support_delegation.rb"
         && p != "runtime/active_support_kernel_reporting.rb"
         && p != "runtime/active_support_file_atomic.rb"
         && p != "runtime/active_support_digest_uuid.rb"
