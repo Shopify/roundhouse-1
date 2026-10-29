@@ -5906,8 +5906,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // filtering methods (core_ext/array/access.rb, array/wrap.rb,
     // enumerable.rb), String's filters (core_ext/string/filters.rb) and
     // ActiveSupport::Delegation with Module#delegate_missing_to
-    // (delegation.rb, core_ext/module/delegation.rb): a native gem's
-    // require of one answers from runtime/features.
+    // (delegation.rb, core_ext/module/delegation.rb), and
+    // ActiveSupport::CurrentAttributes (current_attributes.rb) over
+    // ActiveSupport::Callbacks and CodeGenerator: a native gem's require of
+    // one answers from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
         "active_support_module_attribute_accessors", "active_support_module_introspection", "active_support_module_anonymous", "active_support_redefine_method", "active_support_remove_method",
@@ -5917,6 +5919,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         "active_support_kernel_reporting", "active_support_file_atomic", "active_support_digest_uuid",
         "active_support_securerandom", "active_support_array_access", "active_support_array_wrap",
         "active_support_enumerable", "active_support_string_filters", "active_support_delegation",
+        "active_support_callbacks", "active_support_code_generator", "active_support_current_attributes",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -6726,6 +6729,10 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
     ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
     ("active_support/dependencies/autoload", &["active_support_dependencies_autoload"]),
+    ("active_support/current_attributes", &["active_support_current_attributes"]),
+    ("active_support/callbacks", &["active_support_callbacks"]),
+    ("active_support/code_generator", &["active_support_code_generator"]),
+    ("active_support/execution_context", &["active_support_reporters"]),
     ("active_support/deprecation", &["active_support_deprecation"]),
     ("active_support/deprecator", &["active_support_deprecation"]),
     ("active_support/core_ext/string/filters", &["active_support_string_filters"]),
@@ -15160,6 +15167,8 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_hash_keys.rb"
         && p != "runtime/active_support_string_strip.rb"
         && p != "runtime/active_support_dependencies_autoload.rb"
+        && p != "runtime/active_support_code_generator.rb"
+        && p != "runtime/active_support_current_attributes.rb"
         && p != "runtime/active_support_string_filters.rb"
         && p != "runtime/active_support_array_access.rb"
         && p != "runtime/active_support_array_wrap.rb"

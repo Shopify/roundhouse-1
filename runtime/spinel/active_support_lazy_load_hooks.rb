@@ -274,6 +274,8 @@ module ActiveSupport
     Benchmark: "active_support_benchmark",
     Cache: "active_support_cache",
     Callbacks: "active_support_callbacks",
+    CodeGenerator: "active_support_code_generator",
+    CurrentAttributes: "active_support_current_attributes",
     ColorizeLogging: "active_support_log_subscriber",
     ExecutionContext: "active_support_reporters",
     KeyGenerator: "active_support_messages",

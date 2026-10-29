@@ -74,3 +74,64 @@ fn a_gem_finds_active_support_s_boot_classes_as_it_loads() {
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout, "[\"gadget/widget\", \"Gadget::Widget\", \"Gadget\", true]\ntrue\n");
 }
+
+/// A gem's ActiveSupport::CurrentAttributes subclass (dux-event-reporter-rails'
+/// shape): required by name or reached through Active Support's autoload,
+/// its attributes, defaults, `set` with a block, `resets` and `reset`, per
+/// execution context. Before, `require "active_support/current_attributes"`
+/// was refused by name and the gem did not load.
+#[test]
+fn a_gem_s_current_attributes_subclass_works_as_rails_does() {
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_active_support_boot_classes\n")
+        .write("lib/oracle.rb", "class Oracle\nend\n")
+        .emit(BuildTarget::Ruby);
+    for feature in ["active_support/current_attributes", "active_support/callbacks", "active_support/execution_context"] {
+        assert!(dir.join(format!("runtime/features/{feature}.rb")).exists(), "runtime/features/{feature}.rb");
+    }
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args([
+            "-e",
+            "require_relative 'runtime/active_support_lazy_load_hooks'\n\
+             $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/framework_feature_refusal'\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
+             require_relative 'runtime/active_support_core_ext'\n\
+             AUTOLOADED = ActiveSupport::CurrentAttributes.name\n\
+             require 'active_support/current_attributes'\n\
+             RESETS = []\n\
+             class Current < ActiveSupport::CurrentAttributes\n\
+               attribute :user, :request_id\n\
+               attribute :tags, default: -> { [] }\n\
+               resets { RESETS << :reset }\n\
+               def greeting = \"hi #{user}\"\n\
+             end\n\
+             Current.user = 'ada'\n\
+             Current.tags << :a\n\
+             inside = Current.set(user: 'bob') { [Current.user, Current.greeting] }\n\
+             p [AUTOLOADED, Current.user, Current.request_id, Current.tags, inside, Current.user]\n\
+             ActiveSupport::ExecutionContext.nestable = true\n\
+             ActiveSupport::ExecutionContext.push\n\
+             p Current.user\n\
+             ActiveSupport::ExecutionContext.pop\n\
+             p Current.user\n\
+             Current.reset\n\
+             p [Current.user, Current.tags, RESETS]\n\
+             p $LOADED_FEATURES.grep(%r{/activesupport[-/]}).empty?\n",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout,
+        "[\"ActiveSupport::CurrentAttributes\", \"ada\", nil, [:a], [\"bob\", \"hi bob\"], \"ada\"]\n\
+         nil\n\
+         \"ada\"\n\
+         [nil, [], [:reset]]\n\
+         true\n"
+    );
+}
