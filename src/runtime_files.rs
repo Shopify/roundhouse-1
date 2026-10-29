@@ -79,6 +79,7 @@ pub(crate) const GEM_FACING_PORTS: &[&str] = &[
     "runtime/spinel/active_support_string_filters.rb",
     "runtime/spinel/active_support_enumerable.rb",
     "runtime/spinel/active_support_delegation.rb",
+    "runtime/spinel/active_support_dependencies_autoload.rb",
 ];
 
 /// Real framework and shim declarations, without tests, emit scaffolds or

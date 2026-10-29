@@ -5641,6 +5641,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let deprecation = crate::runtime_files::read_to_string("runtime/spinel/active_support_deprecation.rb")
         .map_err(|e| format!("read deprecation runtime: {e}"))?;
     files.push(("runtime/active_support_deprecation.rb".into(), deprecation));
+    // ActiveSupport::Autoload (8.2.0.alpha dependencies/autoload.rb), which
+    // `require "active_support"` defines before Bundler.require.
+    let autoload = crate::runtime_files::read_to_string("runtime/spinel/active_support_dependencies_autoload.rb")
+        .map_err(|e| format!("read Active Support autoload runtime: {e}"))?;
+    files.push(("runtime/active_support_dependencies_autoload.rb".into(), autoload));
     let deprecation_behavior = deprecation_behavior_block(app);
     let query_log_tags = query_log_tags_block(app);
     let active_job_config = active_job_config_block(app);
@@ -6045,6 +6050,20 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let delegate = "require_relative \"module_delegate\"\n";
             let at = content.find(delegate).ok_or("PostgreSQL bootstrap: missing module_delegate require in gem_facades.rb")? + delegate.len();
             content.insert_str(at, "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n");
+            // Then what active_support.rb itself requires before
+            // Bundler.require: ActiveSupport::Autoload, the deprecator and
+            // ActiveSupport::Logger. A gem extends the first, builds its own
+            // deprecator with the second (`ActiveSupport::Deprecation.new`) and
+            // subclasses the third as it loads; boot.rb's later require of the
+            // deprecation port is then a no-op.
+            let inflector = "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n";
+            let early = at + inflector.len();
+            content.insert_str(
+                early,
+                "require_relative \"active_support_dependencies_autoload\"\n\
+                 require_relative \"active_support_deprecation\"\n\
+                 require_relative \"active_support_logger\"\n",
+            );
             // active_support/i18n.rb, which active_support/railtie loads
             // with `require "rails"`: after the Inflector, whose
             // `ordinal` reads the locale it adds. Then ActiveModel's
@@ -6706,6 +6725,9 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/object/try", &["active_support_tryable"]),
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
     ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
+    ("active_support/dependencies/autoload", &["active_support_dependencies_autoload"]),
+    ("active_support/deprecation", &["active_support_deprecation"]),
+    ("active_support/deprecator", &["active_support_deprecation"]),
     ("active_support/core_ext/string/filters", &["active_support_string_filters"]),
     ("active_support/core_ext/array/access", &["active_support_array_access"]),
     ("active_support/core_ext/array/wrap", &["active_support_array_wrap"]),
@@ -15137,6 +15159,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_concern.rb"
         && p != "runtime/active_support_hash_keys.rb"
         && p != "runtime/active_support_string_strip.rb"
+        && p != "runtime/active_support_dependencies_autoload.rb"
         && p != "runtime/active_support_string_filters.rb"
         && p != "runtime/active_support_array_access.rb"
         && p != "runtime/active_support_array_wrap.rb"
