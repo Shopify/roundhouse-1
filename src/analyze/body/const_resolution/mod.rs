@@ -78,9 +78,6 @@ struct FileAnswers {
     /// Each `X = Y` naming a class or module: X's full name, and the full
     /// name of the namespace Ruby binds it to.
     namespace_aliases: HashMap<Box<str>, Box<str>>,
-    /// Each `class X < Y` this file writes: X's full name, and the full
-    /// name of the class Ruby's lookup binds `Y` to.
-    superclasses: Vec<(Box<str>, Box<str>)>,
     /// The byte ranges of the `class << self` bodies Rubydex does not
     /// index (a `DynamicSingletonDefinition`: no class or module
     /// encloses it, as in `X = Struct.new do class << self … end end`
@@ -108,7 +105,6 @@ impl Clone for FileAnswers {
             alias_definitions: self.alias_definitions.clone(),
             runtime_namespace_aliases: self.runtime_namespace_aliases.clone(),
             namespace_aliases: self.namespace_aliases.clone(),
-            superclasses: self.superclasses.clone(),
             unindexed_singletons: self.unindexed_singletons.clone(),
             sole_namespaces: self.sole_namespaces.clone(),
             singleton_methods: self.singleton_methods.clone(),
@@ -125,9 +121,6 @@ pub(crate) struct ConstResolver {
     /// Full names of the classes and modules Ruby's signatures declare,
     /// RBS class aliases included, as the graph resolved them.
     stdlib_namespaces: HashSet<Box<str>>,
-    /// The superclass every `class X < Y` across the sources binds, by
-    /// X's full name; `None` where two definitions disagree.
-    superclasses: HashMap<Box<str>, Option<Box<str>>>,
     /// Every name `has_source_namespace` answers yes for, gathered once
     /// from `files`: the question used to scan every file's answers.
     source_namespaces: HashSet<Box<str>>,
@@ -558,19 +551,6 @@ impl ConstResolver {
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
         let stdlib_namespaces = stdlib_namespaces(&graph);
         drop(graph);
-        let mut superclasses: HashMap<Box<str>, Option<Box<str>>> = HashMap::default();
-        for (class, parent) in files.iter().flatten().flat_map(|file| file.superclasses.iter()) {
-            match superclasses.entry(class.clone()) {
-                Entry::Vacant(slot) => {
-                    slot.insert(Some(parent.clone()));
-                }
-                Entry::Occupied(mut slot) => {
-                    if slot.get().as_ref() != Some(parent) {
-                        slot.insert(None);
-                    }
-                }
-            }
-        }
         let class_definitions: HashSet<&str> =
             files.iter().flatten().flat_map(|file| file.class_definitions.iter().map(|c| c.as_ref())).collect();
         let mut source_namespaces: HashSet<Box<str>> =
@@ -612,7 +592,6 @@ impl ConstResolver {
         Self {
             files,
             stdlib_namespaces,
-            superclasses,
             source_namespaces,
             nested_namespaces,
             source_constants,
@@ -711,6 +690,13 @@ impl ConstResolver {
         }
     }
 
+    /// Whether the reference resolved through an RBS or runtime class
+    /// alias (`Queue` for `Thread::Queue`), whose written name the
+    /// modeled runtime keeps; not an app's own alias.
+    pub(crate) fn is_framework_alias(&self, span: Span, path: &[Symbol]) -> bool {
+        matches!(self.reference(span, path), Some(Some(ResolvedConstant::Namespace { alias: Some(_), .. })))
+    }
+
     /// A declaration header is not a constant reference. Its body still runs
     /// on the resolved namespace, including qualified reopenings and aliases.
     pub(in crate::analyze) fn namespace_body(&self, span: Span) -> Option<&ClassId> {
@@ -786,15 +772,6 @@ impl ConstResolver {
     /// resolve against.
     pub(crate) fn has_stdlib_namespace(&self, name: &str) -> bool {
         self.stdlib_namespaces.contains(name)
-    }
-
-    /// The full name of the class that `class <name> < Y` binds `Y` to,
-    /// by Ruby's lookup at the `class` keyword: `class Accounting <
-    /// Fuzzy` inside `module Parser` names `Parser::Fuzzy` when that
-    /// class exists. No answer when no source writes a superclass for
-    /// `name`, when `Y` resolves to no class, or when definitions disagree.
-    pub(crate) fn superclass(&self, name: &str) -> Option<&str> {
-        self.superclasses.get(name)?.as_deref()
     }
 
     /// The full declaration name a written constant resolves to, and
@@ -884,7 +861,9 @@ impl PreparedConstResolver {
         self.for_sources_with(sources, false)
     }
 
-    fn for_sources_with(&self, sources: &[SourceFile], postgresql_runtime: bool) -> Arc<ConstResolver> {
+    /// The answers for exactly the sources Rubydex indexed, which ingest
+    /// holds before they become `app.sources`.
+    pub(crate) fn for_sources_with(&self, sources: &[SourceFile], postgresql_runtime: bool) -> Arc<ConstResolver> {
         match &self.0 {
             Some(resolver)
                 if resolver.source_fingerprint == source_fingerprint(sources)
@@ -1330,13 +1309,6 @@ fn answer_file(
                 let full = owner.map_or_else(|| written.to_string(), |owner| format!("{}::{}", hoisted_name(owner.name()), written.as_str()));
                 if matches!(definition, Some(Definition::Class(_) | Definition::Module(_))) {
                     answers.class_definitions.insert(full.clone().into());
-                }
-                if let Some(Definition::Class(class)) = definition
-                    && let Some(reference) = class.superclass_ref()
-                        .and_then(|id| graph.constant_references().get(id))
-                    && let Some(parent) = resolved_namespace(graph, *reference.name_id())
-                {
-                    answers.superclasses.push((full.clone().into(), hoisted_name(parent.name()).into()));
                 }
                 if let Some(Definition::ConstantAlias(alias)) = definition {
                     answers.alias_definitions.insert(full.clone().into());

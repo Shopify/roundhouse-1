@@ -23,6 +23,7 @@ mod uncalled_helper_copies;
 mod pagy;
 mod graphql_ruby;
 mod guarded_include;
+mod written_names;
 pub(crate) mod class_attribute;
 pub(crate) mod autoload_glob;
 pub(crate) mod cattr;

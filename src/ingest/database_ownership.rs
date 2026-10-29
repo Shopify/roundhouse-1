@@ -302,23 +302,6 @@ fn own_decision(
     }
 }
 
-/// The model a written superclass names, from `child`'s namespace out.
-fn resolve_parent<'a>(child: &str, parent: &str, by_name: &HashMap<&'a str, usize>) -> Option<usize> {
-    let parent = parent.trim_start_matches("::");
-    let mut scope: Vec<&str> = child.split("::").collect();
-    scope.pop();
-    loop {
-        let candidate =
-            if scope.is_empty() { parent.to_string() } else { format!("{}::{parent}", scope.join("::")) };
-        if let Some(i) = by_name.get(candidate.as_str()) {
-            return Some(*i);
-        }
-        if scope.pop().is_none() {
-            return None;
-        }
-    }
-}
-
 /// Record `app.model_databases` and the routing refusals. Runs after
 /// every model, concern splice and library class exists.
 pub(super) fn resolve(app: &mut App) {
@@ -340,7 +323,8 @@ pub(super) fn resolve(app: &mut App) {
     let parents: Vec<Option<usize>> = app
         .models
         .iter()
-        .map(|m| m.parent.as_ref().and_then(|p| resolve_parent(m.name.0.as_str(), p.0.as_str(), &by_name)))
+        // Ingest stored each parent as Rubydex resolved it.
+        .map(|m| m.parent.as_ref().and_then(|p| by_name.get(p.0.as_str().trim_start_matches("::")).copied()))
         .collect();
 
     // Nearest deciding class in each model's ancestry.

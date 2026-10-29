@@ -417,6 +417,30 @@ fn ownership_follows_connects_to_through_abstract_parents() {
     assert!(!checked.errors.iter().any(|e| e.contains("archive_records") || e.contains("cold_records")), "{}", checked.errors.join("\n"));
 }
 
+/// Ownership follows the superclass Ruby binds, not the first namespace
+/// that has a class of that name. Inside `module Archive`, `Record` is
+/// `Archive::Record`, which connects to the archive; a top-level compact
+/// `class Archive::Note < Record` does not open `Archive`, so its
+/// `Record` is the top-level one and the model stays on the primary.
+#[test]
+fn ownership_follows_the_superclass_ruby_binds() {
+    let mut files = two_database_files("sqlite3");
+    put(&mut files, "app/models/record.rb", "class Record < ApplicationRecord\n  self.abstract_class = true\nend\n");
+    put(
+        &mut files,
+        "app/models/archive/record.rb",
+        "module Archive\n  class Record < ApplicationRecord\n    self.abstract_class = true\n    connects_to database: { writing: :archive }\n  end\nend\n",
+    );
+    put(&mut files, "app/models/archive/post.rb", "module Archive\n  class Post < Record\n  end\nend\n");
+    put(&mut files, "app/models/archive/note.rb", "class Archive::Note < Record\nend\n");
+    let checked = check(&files);
+    let owners = serde_json::to_value(&checked.app).unwrap()["model_databases"].clone();
+    assert_eq!(owners["Archive::Post"]["named"]["writing"], "archive", "{owners}");
+    assert_eq!(owners["Archive::Post"]["named"]["declared_by"], "Archive::Record", "{owners}");
+    assert_eq!(owners["Archive::Note"], "primary", "{owners}");
+    assert_eq!(owners["Record"], "primary", "{owners}");
+}
+
 #[test]
 fn a_non_primary_database_is_refused_by_adapter() {
     let checked = check(&two_database_files("postgresql"));

@@ -4233,6 +4233,8 @@ fn reject_conditional_accessor(node: &ruby_prism::Node<'_>, file: &str) -> Inges
 /// block contributes to the class it builds (`ingest::factory_class`).
 pub(super) struct FactoryClassBody {
     pub(super) includes: Vec<ClassId>,
+    /// The `include` call of each of `includes`, as `LibraryClass::include_spans`.
+    pub(super) include_spans: Vec<Span>,
     pub(super) methods: Vec<MethodDef>,
     /// The constants a `class << self` in the block writes: the class's
     /// own (see `factory_class_body`).
@@ -4287,6 +4289,7 @@ pub(super) fn factory_class_body(
 
     let DeclBody {
         includes,
+        include_spans,
         mut methods,
         constants,
         unknown_calls,
@@ -4317,7 +4320,7 @@ pub(super) fn factory_class_body(
         });
     }
     admit_nameless_rest(&mut methods);
-    Ok(FactoryClassBody { includes, methods, constants: own, unknown_calls, visibility_overrides })
+    Ok(FactoryClassBody { includes, include_spans, methods, constants: own, unknown_calls, visibility_overrides })
 }
 
 /// Forwardable's `delegate` in a `class << self` that extends it:
@@ -8857,34 +8860,6 @@ fn struct_member_from_expr(call: &Expr) -> Option<SorbetStructMember> {
         }
     }
     Some(SorbetStructMember { name, writable, default, nilable })
-}
-
-/// A library class's superclass as Ruby binds it, when it is a class the
-/// app declares. Ingest records the superclass as written, so `class
-/// Accounting < Fuzzy` inside `module Parser` (shopify-money's
-/// `Money::Parser::Accounting`) parented a `Fuzzy` that no class is. The
-/// subclass inherited none of `Money::Parser::Fuzzy`'s methods, and a
-/// `super(..., **options)` had no destination whose keyword ABI could be
-/// checked. Rubydex resolves the written name at the `class` keyword.
-/// This pass takes that answer only when it names a library class or a
-/// model other than the class itself, so a superclass outside the app
-/// keeps its written path.
-pub(super) fn resolve_library_parents(app: &mut crate::App) {
-    let resolver = app.const_resolver.for_app(app);
-    let known: HashSet<ClassId> = app.library_classes.iter().map(|lc| lc.name.clone())
-        .chain(app.models.iter().map(|model| model.name.clone()))
-        .collect();
-    for lc in app.library_classes.iter_mut().filter(|lc| lc.origin.is_none()) {
-        let Some(written) = &lc.parent else { continue };
-        let Some(resolved) = resolver.superclass(lc.name.0.as_str()) else { continue };
-        if resolved == written.0.as_str().trim_start_matches("::") || resolved == lc.name.0.as_str() {
-            continue;
-        }
-        let resolved = ClassId(Symbol::from(resolved));
-        if known.contains(&resolved) {
-            lc.parent = Some(resolved);
-        }
-    }
 }
 
 /// Expand `const` / `prop` under a base whose ancestry a sidecar says

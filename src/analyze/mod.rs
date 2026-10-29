@@ -51,8 +51,8 @@ mod body;
 mod class_configuration;
 mod data;
 mod class_new;
-pub(crate) use body::{indexed_pluck, lexical_class, string_answers};
-pub(crate) use body::ConstResolverTask;
+pub(crate) use body::{indexed_pluck, string_answers};
+pub(crate) use body::{ConstResolver, ConstResolverTask};
 pub use body::PreparedConstResolver;
 pub mod async_color;
 pub mod attribution;
@@ -1823,7 +1823,6 @@ impl Analyzer {
                     // The ingest's marker for `include Rails.application.routes.
                     // url_helpers`: the generated RouteHelpers module.
                     || included.0.as_str() == "RouteHelpers"
-                    || (!rooted && body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some())
                     || body::RUBY_TOP_LEVEL.contains(&included.0.as_str())
                     // A Ruby-family runtime port's module
                     // (`ActiveRecord::Type::QueryPredicates`); its tree
@@ -1888,7 +1887,6 @@ impl Analyzer {
                     );
                     let known = marker
                         || self.classes.contains_key(&id)
-                        || (!rooted && body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some())
                         || body::RUBY_TOP_LEVEL.contains(&name.as_str())
                         || runtime_reads::ruby_family_runtime_names().contains_key(name.as_str())
                         || crate::project::gem_port_declaring(&name).is_some()
@@ -3904,38 +3902,13 @@ impl Analyzer {
             // that's the boundary with framework-supplied parents
             // (e.g., `ActionController::Base`).
             //
-            // Parents are recorded as written in source, so the nested
-            // declaration style (`module Admin; class AccountsController
-            // < BaseController`) records the unqualified `BaseController`
-            // while the table keys `Admin::BaseController`. Resolve with
-            // Ruby's lexical rule — qualify a single-segment parent
-            // against the child's enclosing namespaces, innermost first,
-            // falling back to top level. Without this the whole ancestor
-            // walk (inherited filters AND inherited actions) silently
-            // no-ops for every nested-style controller.
-            let resolve_parent = |child: &ClassId, parent: &ClassId| -> ClassId {
-                if meta_by_name.contains_key(parent) || parent.0.as_str().contains("::") {
-                    return parent.clone();
-                }
-                let mut segs: Vec<&str> = child.0.as_str().split("::").collect();
-                segs.pop(); // drop the class itself, keep enclosing modules
-                while !segs.is_empty() {
-                    let candidate = ClassId(Symbol::from(
-                        format!("{}::{}", segs.join("::"), parent.0.as_str()).as_str(),
-                    ));
-                    if meta_by_name.contains_key(&candidate) {
-                        return candidate;
-                    }
-                    segs.pop();
-                }
-                parent.clone()
-            };
+            // Ingest stored each parent as Rubydex resolved it, so the
+            // nested `module Admin; class AccountsController <
+            // BaseController` already names `Admin::BaseController`.
             let mut ancestors: Vec<(ClassId, &ControllerMeta)> = Vec::new();
-            let mut current = ctrl_name.clone();
             let mut walk = controller.parent.clone();
             let mut visited: BTreeSet<ClassId> = BTreeSet::new();
             while let Some(parent_id) = walk {
-                let parent_id = resolve_parent(&current, &parent_id);
                 if !visited.insert(parent_id.clone()) {
                     // Defensive: cycles shouldn't exist in real Rails
                     // inheritance, but guard against pathological ingests.
@@ -3944,7 +3917,6 @@ impl Analyzer {
                 let Some(parent_meta) = meta_by_name.get(&parent_id) else { break };
                 ancestors.push((parent_id.clone(), parent_meta));
                 walk = parent_link_by_name.get(&parent_id).cloned().flatten();
-                current = parent_id;
             }
 
             // Build chained filters: ancestors first (oldest → newest),
@@ -5966,7 +5938,6 @@ impl Analyzer {
             &self.inferred_params,
             &self.callers_by_target,
             prev,
-            |id, parent| self.lexical_parent(id, parent),
         )
     }
 
@@ -6381,7 +6352,7 @@ impl Analyzer {
     /// `extend self` is the module-function idiom, handled at ingest.
     fn fold_extended_modules(&mut self, app: &App) {
         let mut wanted: Vec<(ClassId, Vec<ClassId>)> = Vec::new();
-        let extends_of = |exprs: &mut dyn Iterator<Item = &Expr>, owner: &ClassId| {
+        let extends_of = |exprs: &mut dyn Iterator<Item = &Expr>| {
             let mut out: Vec<ClassId> = Vec::new();
             for expr in exprs {
                 let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
@@ -6390,26 +6361,12 @@ impl Analyzer {
                 }
                 for arg in args {
                     let ExprNode::Const { path } = &*arg.node else { continue };
-                    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-                    // Lexical resolution: the enclosing scopes outward.
-                    let mut scope: Vec<&str> = owner.0.as_str().split("::").collect();
-                    let mut resolved = None;
-                    loop {
-                        let candidate = if scope.is_empty() {
-                            written.clone()
-                        } else {
-                            format!("{}::{written}", scope.join("::"))
-                        };
-                        if self.classes.contains_key(&ClassId(Symbol::from(candidate.as_str()))) {
-                            resolved = Some(ClassId(Symbol::from(candidate.as_str())));
-                            break;
-                        }
-                        if scope.is_empty() {
-                            break;
-                        }
-                        scope.pop();
-                    }
-                    if let Some(id) = resolved {
+                    // Rubydex resolved the written name in its real
+                    // nesting; one it has no answer for names no source
+                    // module, so it is read as written.
+                    let id = self.const_resolver.namespace(arg.span, path).cloned()
+                        .unwrap_or_else(|| mixin_path_id(path));
+                    if self.classes.contains_key(&id) {
                         out.push(id);
                     }
                 }
@@ -6421,13 +6378,13 @@ impl Analyzer {
                 ModelBodyItem::Unknown { expr, .. } => Some(expr),
                 _ => None,
             });
-            let ext = extends_of(&mut items, &model.name);
+            let ext = extends_of(&mut items);
             if !ext.is_empty() {
                 wanted.push((model.name.clone(), ext));
             }
         }
         for lc in &app.library_classes {
-            let ext = extends_of(&mut lc.unknown_calls.iter(), &lc.name);
+            let ext = extends_of(&mut lc.unknown_calls.iter());
             if !ext.is_empty() {
                 wanted.push((lc.name.clone(), ext));
             }
@@ -7113,7 +7070,7 @@ impl Analyzer {
                 }
             }
             let Some(parent) = &info.parent else { break };
-            cur = self.lexical_parent(&cur, parent);
+            cur = parent.clone();
         }
         None
     }
@@ -7149,35 +7106,9 @@ impl Analyzer {
                 }
             }
             let Some(parent) = &info.parent else { break };
-            cur = self.lexical_parent(&cur, parent);
+            cur = parent.clone();
         }
         None
-    }
-
-    /// Parents are recorded as written, so `module Api; class
-    /// AuthsController < BaseController` records `BaseController` for
-    /// the class the registry keys `Api::BaseController`. A parent the
-    /// registry knows is taken as it is: the record drops a leading `::`
-    /// (`< ::Operation` and `< Operation` both read `Operation`), and a
-    /// source library class's parent is already bound by Ruby's lookup
-    /// (rubydex at ingest, `superclass_binding` for a gem's class). Only a
-    /// single-segment parent no class is gets qualified against the
-    /// child's enclosing namespaces, innermost first.
-    fn lexical_parent(&self, child: &ClassId, parent: &ClassId) -> ClassId {
-        if self.classes.contains_key(parent) || parent.0.as_str().contains("::") {
-            return parent.clone();
-        }
-        let mut segs: Vec<&str> = child.0.as_str().split("::").collect();
-        segs.pop();
-        while !segs.is_empty() {
-            let candidate =
-                ClassId(Symbol::from(format!("{}::{}", segs.join("::"), parent.0.as_str()).as_str()));
-            if self.classes.contains_key(&candidate) {
-                return candidate;
-            }
-            segs.pop();
-        }
-        parent.clone()
     }
 
     /// The param-table twin of `fold_concern_surfaces`.

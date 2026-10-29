@@ -27,9 +27,6 @@ pub(super) fn preserve_record_receiver_returns(lcs: &mut [LibraryClass], app: &A
     let templates = crate::runtime_src::parse_methods(
         "def reload(options = nil)\n  super(options)\n  self\nend\ndef lock!(lock = true)\n  super(lock)\n  self\nend\n",
     ).expect("receiver-return forwarders parse");
-    let classes: HashMap<ClassId, ()> = app.models.iter().map(|m| &m.name)
-        .chain(app.library_classes.iter().map(|lc| &lc.name))
-        .map(|id| (id.clone(), ())).collect();
     for lc in lcs {
         if !app.models.iter().any(|m| m.name == lc.name && app.schema.tables.contains_key(&m.table.0)) {
             continue;
@@ -37,7 +34,7 @@ pub(super) fn preserve_record_receiver_returns(lcs: &mut [LibraryClass], app: &A
         let self_ty = Ty::Class { id: lc.name.clone(), args: vec![].into() };
         for template in &templates {
             if lc.methods.iter().any(|m| m.name == template.name && m.receiver == MethodReceiver::Instance)
-                || record_return_overridden(app, &classes, &lc.name, template.name.as_str())
+                || record_return_overridden(app, &lc.name, template.name.as_str())
             {
                 continue;
             }
@@ -80,7 +77,8 @@ pub(super) fn chain_inherited_lifecycle_hooks(lcs: &mut [LibraryClass], app: &Ap
     let parents: HashMap<ClassId, Option<ClassId>> = lcs
         .iter()
         .map(|lc| {
-            let parent = lc.parent.as_ref().and_then(|p| crate::analyze::lexical_class(p, lc.name.0.as_str(), &classes));
+            // Ingest stored the parent as Rubydex resolved it.
+            let parent = lc.parent.clone().filter(|p| classes.contains_key(p));
             (lc.name.clone(), parent)
         })
         .collect();
@@ -136,38 +134,32 @@ pub(super) fn chain_inherited_lifecycle_hooks(lcs: &mut [LibraryClass], app: &Ap
 
 /// Source overrides, including those on ApplicationRecord or a mixin,
 /// may return a different object. Do not interpose a self-returning wrapper.
-fn record_return_overridden(app: &App, classes: &HashMap<ClassId, ()>, class: &ClassId, method: &str) -> bool {
+fn record_return_overridden(app: &App, class: &ClassId, method: &str) -> bool {
     let mut pending = vec![class.clone()];
     let mut seen = BTreeSet::new();
     while let Some(id) = pending.pop() {
         if !seen.insert(id.clone()) { continue; }
-        // Per-file ingest can retain a relative include. Resolve it in
-        // its owner's scope before looking for the concern's override.
-        let resolve = |written: &ClassId| crate::analyze::lexical_class(written, id.0.as_str(), classes)
-            .unwrap_or_else(|| written.clone());
         let relevant = |m: &MethodDef| m.receiver == MethodReceiver::Instance
             && (m.name.as_str() == method || (method == "lock!" && m.name.as_str() == "reload"));
         if let Some(model) = app.models.iter().find(|m| m.name == id) {
             if model.methods().any(relevant) { return true; }
-            // Parents are written relative to the subclass (`< Base` inside
-            // `module Admin`); resolve them the same way includes already are.
-            pending.extend(model.parent.iter().map(resolve));
+            // Ingest stored parents and includes as Rubydex resolved them.
+            pending.extend(model.parent.iter().cloned());
             for item in &model.body {
                 let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
                 let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
                 if method.as_str() != "include" { continue; }
                 for arg in args {
                     if let ExprNode::Const { path } = &*arg.node {
-                        let written = ClassId(Symbol::from(path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::")));
-                        pending.push(resolve(&written));
+                        pending.push(crate::analyze::mixin_path_id(path));
                     }
                 }
             }
         }
         if let Some(lc) = app.library_classes.iter().find(|lc| lc.name == id) {
             if lc.methods.iter().any(relevant) { return true; }
-            pending.extend(lc.parent.iter().map(resolve));
-            pending.extend(lc.includes.iter().map(resolve));
+            pending.extend(lc.parent.iter().cloned());
+            pending.extend(lc.includes.iter().cloned());
         }
     }
     false
@@ -11966,8 +11958,7 @@ fn emit_library_class_decl_inner(
     // so emit works correctly from any output directory.
     let mut requires: Vec<String> = Vec::new();
     if let Some(parent) = lc.parent.as_ref() {
-        let written = ClassId(Symbol::from(written_parent(lc, parent, app).as_str()));
-        let parent = lexical_parent(name, &written, app);
+        // Ingest stored the parent as Rubydex resolved it.
         let parent = ClassId(Symbol::from(parent.0.as_str().trim_start_matches("::")));
         if let Some(anchor) = require_path_for_parent(&parent, app) {
             if anchor != self_anchor {
@@ -20240,10 +20231,9 @@ fn inherited_copy(c: &LibraryClass, m: &crate::dialect::MethodDef, app: &App) ->
         return false;
     }
     let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
-    let mut current = c.name.0.as_str().to_string();
     let mut parent = c.parent.clone();
     while let Some(p) = parent {
-        let ancestor = lexical_parent(&current, &p, app).0.as_str().trim_start_matches("::").to_string();
+        let ancestor = p.0.as_str().trim_start_matches("::").to_string();
         if !seen.insert(ancestor.clone()) {
             return false;
         }
@@ -20255,7 +20245,6 @@ fn inherited_copy(c: &LibraryClass, m: &crate::dialect::MethodDef, app: &App) ->
             return true;
         }
         parent = classes.iter().find_map(|a| a.parent.clone());
-        current = ancestor;
     }
     false
 }
@@ -20392,30 +20381,6 @@ fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
         .find(|t| t.name.0.as_str() == name)
         .and_then(|t| t.parent.as_ref())
         .map(super::emitted_test_parent)
-}
-
-/// The app class a written superclass names, looked up from the child's
-/// namespace outward as Ruby does: `PodConnectionConfigProvider` written
-/// in `Podding::Database::VmsPodConnectionConfigProvider` is
-/// `Podding::Database::PodConnectionConfigProvider`. A name that matches
-/// no app class at any level is returned as written (a runtime or gem
-/// class).
-fn lexical_parent(child: &str, parent: &ClassId, app: &App) -> ClassId {
-    let written = parent.0.as_str();
-    if written.starts_with("::") {
-        return parent.clone();
-    }
-    let defined = |candidate: &str| is_model_or_library_class(candidate, app) || is_controller_named(candidate, app);
-    let mut scope: Vec<&str> = child.split("::").collect();
-    scope.pop();
-    while !scope.is_empty() {
-        let candidate = format!("{}::{written}", scope.join("::"));
-        if defined(&candidate) {
-            return ClassId(crate::ident::Symbol::from(candidate.as_str()));
-        }
-        scope.pop();
-    }
-    parent.clone()
 }
 
 fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
