@@ -54,8 +54,14 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// A directory of this call's own: the tests here run at once (each in its
+/// own process under nextest), and a shared name let one test's
+/// `remove_dir_all` empty another's emitted tree mid-read.
 fn scratch(tag: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("fixture-model-uuid-{tag}"));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("fixture-model-uuid-{tag}-{}-{call}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

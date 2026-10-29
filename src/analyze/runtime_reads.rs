@@ -93,10 +93,18 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
 /// rescue, and `security_utils.rb` answers
 /// `ActiveSupport::SecurityUtils.secure_compare`, and
 /// `action_dispatch/session.rb` declares the `ActionDispatch::Session`
-/// object the session-store port reopens. A name either declares stays
+/// object the session-store port reopens, and `active_job.rb` declares
+/// `ActiveJob::Base` (which the callbacks port reopens to replace its
+/// `enqueue_after_transaction_commit` writer) and
+/// `ActiveJob::DeserializationError`. A name either declares stays
 /// ungated though a gated port declares it too.
-const SHARED_RUNTIME: &[&str] =
-    &["runtime/ruby/active_support_ext.rb", "runtime/ruby/security_utils.rb", "runtime/ruby/logger.rb", "runtime/ruby/action_dispatch/session.rb"];
+const SHARED_RUNTIME: &[&str] = &[
+    "runtime/ruby/active_support_ext.rb",
+    "runtime/ruby/security_utils.rb",
+    "runtime/ruby/logger.rb",
+    "runtime/ruby/action_dispatch/session.rb",
+    "runtime/ruby/active_job.rb",
+];
 
 /// Runtime files whose VALUES are gated though their namespaces are not:
 /// railties' Rails::Railtie and Rails::Engine are a lowering's concern
@@ -1008,7 +1016,6 @@ mod tests {
             ("ActiveSupport::DeprecationException", "runtime/active_support_deprecation.rb"),
             ("ActiveJob::EnqueueError", "runtime/active_job_errors.rb"),
             ("ActiveJob::UnknownJobClassError", "runtime/active_job_errors.rb"),
-            ("ActiveJob::DeserializationError", "runtime/active_job_errors.rb"),
             ("ActiveJob::DeserializationError::RecordNotFound", "runtime/active_job_errors.rb"),
             ("ActiveJob::SerializationError", "runtime/active_job_errors.rb"),
             ("ActiveSupport::Tryable", "runtime/active_support_tryable.rb"),
@@ -1038,10 +1045,12 @@ mod tests {
         assert!(!names.contains_key("ActiveSupport"), "{names:?}");
         assert!(!names.contains_key("Rails"), "{names:?}");
         assert!(!names.contains_key("Rails::Application"), "{names:?}");
-        // active_job.rb declares these for every target; the callbacks
-        // port adds modules beside Base and does not reopen it.
+        // active_job.rb declares these for every target. The callbacks
+        // port reopens Base and the errors port declares
+        // DeserializationError too; RecordNotFound under it is the port's.
         assert!(!names.contains_key("ActiveJob"), "{names:?}");
         assert!(!names.contains_key("ActiveJob::Base"), "{names:?}");
+        assert!(!names.contains_key("ActiveJob::DeserializationError"), "{names:?}");
         // runtime/ruby/action_dispatch/session.rb declares it for every target.
         assert!(!names.contains_key("ActionDispatch::Session"), "{names:?}");
         // active_support_ext.rb and security_utils.rb declare these for
