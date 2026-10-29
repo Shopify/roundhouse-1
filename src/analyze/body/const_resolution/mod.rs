@@ -542,7 +542,11 @@ impl ConstResolver {
         let class_ancestry = graph.declarations().values().filter_map(|declaration| {
             let namespace = declaration.as_namespace()?;
             if namespace.kind() != "Class" { return None; }
-            let mut ancestors = vec![ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))];
+            let own = ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()));
+            // Rubydex lists the class itself after its prepended modules, as
+            // Ruby's `ancestors` does; keep that position rather than forcing
+            // the class first.
+            let mut ancestors = Vec::new();
             for ancestor in namespace.ancestors() {
                 // Mutation reachability needs the known edges even when a
                 // gem superclass leaves the rest of the ancestry incomplete.
@@ -553,7 +557,8 @@ impl ConstResolver {
                     if !ancestors.contains(&id) { ancestors.push(id); }
                 }
             }
-            Some((ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref())), ancestors))
+            if !ancestors.contains(&own) { ancestors.insert(0, own.clone()); }
+            Some((own, ancestors))
         }).collect();
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
         let stdlib_namespaces = stdlib_namespaces(&graph);
@@ -1893,6 +1898,26 @@ mod tests {
                 .replace("prepend Mixins", "prepen_ Mixins")
         );
         assert!(dynamic_mixin_projection("class A\n  include B\n  extend C::D\n  extend self\nend\n").is_none());
+    }
+
+    #[test]
+    fn class_ancestry_keeps_prepended_modules_ahead_of_the_class() {
+        let sources = vec![SourceFile {
+            path: "app/models/wrapped.rb".into(),
+            text: "\
+module Loud; end
+module Quiet; end
+class Speaker; end
+class Wrapped < Speaker
+  prepend Loud
+  include Quiet
+end
+".into(),
+        }];
+        let resolver = ConstResolver::from_app_sources(&sources);
+        let ancestry = resolver.class_ancestry(&ClassId(Symbol::from("Wrapped"))).unwrap();
+        let names: Vec<&str> = ancestry.iter().map(|class| class.0.as_str()).take(4).collect();
+        assert_eq!(names, ["Loud", "Wrapped", "Quiet", "Speaker"]);
     }
 
     #[test]
