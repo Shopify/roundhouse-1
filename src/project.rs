@@ -14168,16 +14168,14 @@ fn report_strict_validation_contexts(app: &App, target: BuildTarget) {
     // and `validation_context` with its validations; an ActiveRecord
     // model's are the runtime's.
     let active_record = |model: &crate::dialect::Model| model.parent.is_some();
+    let ancestry = crate::ancestry::Ancestors::for_app(app);
     let model_of = |lc: &crate::dialect::LibraryClass| {
-        let mut cursor = lc.parent.clone();
-        for _ in 0..8 {
-            let parent = cursor?;
-            if let Some(model) = app.models.iter().find(|m| m.name == parent) {
-                return Some(model);
-            }
-            cursor = app.library_classes.iter().find(|c| c.name == parent)?.parent.clone();
-        }
-        None
+        ancestry
+            .superclasses(&lc.name)
+            .into_iter()
+            .skip(1)
+            .take(8)
+            .find_map(|parent| app.models.iter().find(|m| m.name == parent))
     };
     let target = target.as_str();
     let mut spans: Vec<crate::span::Span> = Vec::new();

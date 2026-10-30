@@ -460,15 +460,12 @@ impl RefinedNames {
 /// Whether `model` or one of its ancestors declares `method` as a
 /// relation-returning class method.
 fn model_declares_scope(registry: &HashMap<ClassId, ClassInfo>, model: &ClassId, method: &Symbol) -> bool {
-    let mut current = Some(model.clone());
-    for _ in 0..32 {
-        let Some(ci) = current.and_then(|id| registry.get(&id)) else { return false };
-        if ci.class_methods.get(method).is_some_and(returns_relation) {
-            return true;
-        }
-        current = ci.parent.clone();
-    }
-    false
+    crate::ancestry::Ancestors::new(None, registry)
+        .superclasses(model)
+        .iter()
+        .take(32)
+        .map_while(|id| registry.get(id))
+        .any(|ci| ci.class_methods.get(method).is_some_and(returns_relation))
 }
 
 /// A relation-returning class method's type: a `Relation`, or a method

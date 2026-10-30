@@ -182,6 +182,19 @@ impl<'a> Classes<'a> {
     }
 }
 
+/// The registry's links, each read noted (`Classes::get`).
+impl crate::ancestry::Links for Classes<'_> {
+    fn parent(&self, id: &ClassId) -> Option<ClassId> {
+        self.get(id)?.parent().cloned()
+    }
+    fn includes(&self, id: &ClassId) -> Vec<ClassId> {
+        self.get(id).map(|info| info.includes().to_vec()).unwrap_or_default()
+    }
+    fn extends(&self, id: &ClassId) -> Vec<ClassId> {
+        self.get(id).map(|info| info.extends.clone()).unwrap_or_default()
+    }
+}
+
 /// The [`DepKey::Class`] stamped whenever a class is created or removed:
 /// what a scan over the whole registry reads besides the classes it
 /// visited.

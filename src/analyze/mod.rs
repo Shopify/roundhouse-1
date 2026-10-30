@@ -52,7 +52,7 @@ mod class_configuration;
 mod data;
 mod class_new;
 pub(crate) use body::{indexed_pluck, string_answers};
-pub(crate) use body::{ConstResolver, ConstResolverTask};
+pub(crate) use body::{Ancestry, ConstResolver, ConstResolverTask, SingletonAncestor};
 pub use body::PreparedConstResolver;
 pub mod async_color;
 pub mod attribution;
@@ -6428,6 +6428,23 @@ impl Analyzer {
         }
     }
 
+    /// The modules `id` mixes in, with their own included modules, nearest
+    /// first (`crate::ancestry`): its ancestors after itself that are not
+    /// its superclass's (a module the superclass prepends sits between
+    /// them in the chain, and is not the class's own).
+    fn own_mixins<L: crate::ancestry::Links>(ancestry: &crate::ancestry::Ancestors<'_, L>, id: &ClassId) -> Vec<ClassId> {
+        let chain = ancestry.of(id);
+        // A class that writes no superclass has Ruby's `Object`.
+        let parent = ancestry.parent(id).unwrap_or_else(|| ClassId(Symbol::from("Object")));
+        let parent_prepends = ancestry.prepends(&parent);
+        let start = chain.iter().position(|ancestor| ancestor == id).map_or(0, |at| at + 1);
+        chain[start.min(chain.len())..]
+            .iter()
+            .take_while(|ancestor| **ancestor != parent && !parent_prepends.contains(ancestor))
+            .cloned()
+            .collect()
+    }
+
     fn fold_concern_surfaces(&mut self, app: &App) {
         type Surface = (HashMap<Symbol, Ty>, HashMap<Symbol, Ty>, Vec<ClassId>);
         let module_surfaces: HashMap<ClassId, Surface> = app
@@ -6457,22 +6474,24 @@ impl Analyzer {
             .filter(|(_, c)| !c.includes.is_empty())
             .map(|(id, c)| (id.clone(), c.includes.clone()))
             .collect();
-        for (id, includes) in targets {
-            // Transitive closure over module includes.
-            let mut queue = includes;
-            let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
-            let mut qi = 0;
-            while qi < queue.len() {
-                let m = queue[qi].clone();
-                qi += 1;
-                let Some((inst, class_side, nested)) = module_surfaces.get(&m) else {
+        // One accessor for the whole pass: its linearizations are reused,
+        // and the links it reads (parents, includes) are not what the
+        // fold changes.
+        let mixins: Vec<(ClassId, Vec<ClassId>)> = {
+            let ancestry = crate::ancestry::Ancestors::new(Some(&self.const_resolver), &self.classes);
+            targets.into_iter().map(|(id, _)| {
+                let own = Self::own_mixins(&ancestry, &id);
+                (id, own)
+            }).collect()
+        };
+        for (id, own) in mixins {
+            // Every module the class mixes in, its modules' own included,
+            // the farthest first, so the nearest one's method wins as in
+            // Ruby's lookup.
+            for m in own.into_iter().rev() {
+                let Some((inst, class_side, _)) = module_surfaces.get(&m) else {
                     continue;
                 };
-                for n in nested {
-                    if seen.insert(n.clone()) {
-                        queue.push(n.clone());
-                    }
-                }
                 let folded = self.concern_folded.entry(id.clone()).or_default();
                 let cls = self.classes.entry(id.clone()).or_default();
                 for (name, ty) in inst {
@@ -6519,22 +6538,15 @@ impl Analyzer {
         }
         // Module → the non-module classes that include it, transitively.
         let mut hosts: HashMap<ClassId, BTreeSet<ClassId>> = HashMap::default();
-        for (id, cls) in &self.classes {
-            if modules.contains(id) || cls.includes.is_empty() {
-                continue;
-            }
-            let mut queue = cls.includes.clone();
-            let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
-            let mut qi = 0;
-            while qi < queue.len() {
-                let m = queue[qi].clone();
-                qi += 1;
-                if modules.contains(&m) {
-                    hosts.entry(m.clone()).or_default().insert(id.clone());
+        {
+            let ancestry = crate::ancestry::Ancestors::new(Some(&self.const_resolver), &self.classes);
+            for (id, cls) in &self.classes {
+                if modules.contains(id) || cls.includes.is_empty() {
+                    continue;
                 }
-                for n in self.classes.get(&m).map(|c| c.includes.as_slice()).unwrap_or_default() {
-                    if seen.insert(n.clone()) {
-                        queue.push(n.clone());
+                for m in Self::own_mixins(&ancestry, id) {
+                    if modules.contains(&m) {
+                        hosts.entry(m).or_default().insert(id.clone());
                     }
                 }
             }

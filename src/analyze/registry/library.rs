@@ -410,36 +410,14 @@ pub(in crate::analyze) fn register(
     // `def perform(…)` but *calls* `FooWorker.perform_async(…)` /
     // `perform_in(delay, …)` / `perform_at(time, …)`, all of which
     // return the job id String (invariably discarded). Same shape
-    // as the mailer pass above: identify workers by walking the
-    // parent chain (Mastodon subclasses base workers, e.g.
-    // `UpdateDistributionWorker < RawDistributionWorker`) checking
-    // each level's `include` list, then register the enqueue
-    // methods. `entry().or_insert` so a real `def self.` wins.
+    // as the mailer pass above: identify workers by their ancestors
+    // (Mastodon subclasses base workers, e.g.
+    // `UpdateDistributionWorker < RawDistributionWorker`), then
+    // register the enqueue methods. `entry().or_insert` so a real `def self.` wins.
     {
-        let lc_of: HashMap<&ClassId, &crate::dialect::LibraryClass> = app
-            .library_classes
-            .iter()
-            .map(|lc| (&lc.name, lc))
-            .collect();
+        let ancestry = crate::ancestry::Ancestors::for_app(app);
         let is_worker = |start: &ClassId| -> bool {
-            let mut cur = Some(start);
-            let mut depth = 0usize;
-            while let Some(id) = cur {
-                let Some(lc) = lc_of.get(id) else { break };
-                if lc
-                    .includes
-                    .iter()
-                    .any(|inc| matches!(inc.0.as_str(), "Sidekiq::Worker" | "Sidekiq::Job"))
-                {
-                    return true;
-                }
-                depth += 1;
-                if depth > 32 {
-                    break;
-                }
-                cur = lc.parent.as_ref();
-            }
-            false
+            ancestry.of(start).iter().any(|module| matches!(module.0.as_str(), "Sidekiq::Worker" | "Sidekiq::Job"))
         };
         for lc in &app.library_classes {
             if !is_worker(&lc.name) {

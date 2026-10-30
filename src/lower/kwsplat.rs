@@ -798,17 +798,12 @@ fn callee_params<'s>(
     } else {
         method.clone()
     };
-    let mut current = Some(id.clone());
-    // Same cycle cap `normalize_trailing_kwargs` uses — a malformed
-    // parent chain must not hang the compiler.
-    for _ in 0..32 {
-        let cid = current?;
-        if let Some(params) = sigs.methods.get(&(cid.clone(), lookup.clone())) {
-            return Some(params);
-        }
-        current = sigs.parents.get(&cid).cloned();
-    }
-    None
+    // Same cap `normalize_trailing_kwargs` uses.
+    crate::ancestry::Ancestors::new(None, crate::ancestry::ParentLinks(|cid: &ClassId| sigs.parents.get(cid).cloned()))
+        .superclasses(id)
+        .into_iter()
+        .take(32)
+        .find_map(|cid| sigs.methods.get(&(cid, lookup.clone())))
 }
 
 /// Evaluated once per keyword, so only expressions that are free of

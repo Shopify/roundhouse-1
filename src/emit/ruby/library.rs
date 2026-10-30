@@ -18064,18 +18064,25 @@ fn module_defines<'a>(m: &'a LibraryClass, name: &str, app: &'a App, seen: &mut 
 }
 
 /// The app library classes `lc` inherits from, nearest first: its
-/// superclass chain while each link is an app library class
-/// (`app_library_superclass`); a model or a non-app class ends it.
+/// superclass chain (`crate::ancestry`) while each link is an app
+/// library class; a model or a non-app class ends it.
 fn app_library_ancestors<'a>(lc: &'a LibraryClass, app: &'a App) -> Vec<&'a LibraryClass> {
+    // The emitter's name index answers each hop (`library_classes_named`).
+    let links = crate::ancestry::ParentLinks(|id: &ClassId| {
+        library_classes_named(id.0.as_str(), app).into_iter().find(|c| !c.is_module)?.parent.clone()
+    });
+    let ancestry = crate::ancestry::Ancestors::new(None, links);
     let mut ancestors: Vec<&LibraryClass> = Vec::new();
-    let mut at = lc;
-    while let Some(parent) = at.parent.as_ref() {
-        let Some(next) = app_library_superclass(at, &written_parent(at, parent, app), app) else { break };
+    for class in ancestry.above(lc.parent.as_ref()) {
+        let name = class.0.as_str();
+        if is_model_named(name, app) {
+            break;
+        }
+        let Some(next) = library_classes_named(name, app).into_iter().find(|c| !c.is_module) else { break };
         if ancestors.iter().any(|a| std::ptr::eq(*a, next)) || std::ptr::eq(next, lc) {
             break;
         }
         ancestors.push(next);
-        at = next;
     }
     ancestors
 }
@@ -18263,30 +18270,6 @@ fn loaded_gem_module(lc: &LibraryClass, written: &str, app: &App) -> Option<Clas
             return None;
         }
         scope.pop()?;
-    }
-}
-
-/// The app library class (not a module, not a model) a superclass
-/// spelling names, resolved as Ruby does from the subclass's lexical
-/// namespace outwards (`Component::Schema` written inside `module
-/// Billing` is `Billing::Component::Schema` when that exists).
-fn app_library_superclass<'a>(lc: &LibraryClass, written: &str, app: &'a App) -> Option<&'a LibraryClass> {
-    let rooted = written.starts_with("::");
-    let written = written.trim_start_matches("::");
-    let mut scope: Vec<&str> = if rooted { Vec::new() } else { lc.name.0.as_str().split("::").collect() };
-    scope.pop();
-    loop {
-        let candidate =
-            if scope.is_empty() { written.to_string() } else { format!("{}::{written}", scope.join("::")) };
-        if is_model_named(&candidate, app) {
-            return None;
-        }
-        if let Some(found) = library_classes_named(&candidate, app).into_iter().find(|c| !c.is_module) {
-            return Some(found);
-        }
-        if scope.pop().is_none() {
-            return None;
-        }
     }
 }
 

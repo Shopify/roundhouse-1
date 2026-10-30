@@ -3689,15 +3689,12 @@ end
     // parents) declare a default scope of their own.
     let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
     let mut scoped: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
-    for lc in app.library_classes.iter().filter(|lc| crate::lower::default_scope::subclass_declares(lc)) {
-        let mut cursor = lc.parent.clone();
-        for _ in 0..8 {
-            let Some(parent) = cursor else { break };
-            if models.contains(&parent) {
-                scoped.insert(parent);
-                break;
+    {
+        let ancestry = crate::ancestry::Ancestors::for_app(&app);
+        for lc in app.library_classes.iter().filter(|lc| crate::lower::default_scope::subclass_declares(lc)) {
+            if let Some(model) = ancestry.superclasses(&lc.name).into_iter().skip(1).take(8).find(|parent| models.contains(parent)) {
+                scoped.insert(model);
             }
-            cursor = app.library_classes.iter().find(|o| o.name == parent).and_then(|o| o.parent.clone());
         }
     }
     for model in &mut app.models {
@@ -4111,25 +4108,15 @@ fn attach_subclass_declarations(
     declarations: Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>,
 ) {
     let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
-    let mut lc_parent: HashMap<&crate::ident::ClassId, &Option<crate::ident::ClassId>> = HashMap::default();
-    for other in &app.library_classes {
-        lc_parent.entry(&other.name).or_insert(&other.parent);
-    }
     let mut declared: HashMap<crate::ident::ClassId, Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>> =
         HashMap::default();
-    for (sub, items) in declarations {
-        let mut cursor = lc_parent.get(&sub).and_then(|p| (*p).clone());
-        let mut base = None;
-        for _ in 0..8 {
-            let Some(parent) = cursor else { break };
-            if models.contains(&parent) {
-                base = Some(parent);
-                break;
-            }
-            cursor = lc_parent.get(&parent).and_then(|p| (*p).clone());
+    {
+        let ancestry = crate::ancestry::Ancestors::for_app(app);
+        for (sub, items) in declarations {
+            let base = ancestry.superclasses(&sub).into_iter().skip(1).take(8).find(|parent| models.contains(parent));
+            let Some(base) = base else { continue };
+            declared.entry(base).or_default().push((sub, items));
         }
-        let Some(base) = base else { continue };
-        declared.entry(base).or_default().push((sub, items));
     }
     for model in &mut app.models {
         model.subclass_declarations = declared.remove(&model.name).unwrap_or_default();
@@ -6033,19 +6020,10 @@ fn synthesize_template_only_actions(app: &mut App) {
     };
     let defines = |controller: &crate::dialect::Controller, action: &Symbol| {
         // The controller itself, then its ancestors within the app.
-        let mut current = Some(controller);
-        let mut depth = 0;
-        while let Some(c) = current {
-            if c.actions().any(|a| &a.name == action) {
-                return true;
-            }
-            depth += 1;
-            if depth > 32 {
-                break;
-            }
-            current = c.parent.as_ref().and_then(|p| app.controllers.iter().find(|o| &o.name == p));
-        }
-        false
+        let chain = crate::ancestry::Ancestors::new(None, crate::ancestry::ControllerList::scan(&app.controllers)).above(controller.parent.as_ref());
+        std::iter::once(controller)
+            .chain(chain.iter().take(32).map_while(|p| app.controllers.iter().find(|o| o.name == *p)))
+            .any(|c| c.actions().any(|a| &a.name == action))
     };
 
     let mut missing: BTreeSet<(crate::ident::ClassId, Symbol)> = BTreeSet::new();
@@ -6516,23 +6494,12 @@ fn splice_concerns_into_controllers(app: &mut App) {
 fn routed_actions_with_descendants(
     app: &App,
 ) -> HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>> {
-    let parents: HashMap<&crate::ident::ClassId, &crate::ident::ClassId> = app
-        .controllers
-        .iter()
-        .filter_map(|c| c.parent.as_ref().map(|p| (&c.name, p)))
-        .collect();
+    let ancestry = crate::ancestry::Ancestors::new(None, crate::ancestry::ControllerList::new(&app.controllers));
     let mut out: HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>> =
         HashMap::default();
     for route in crate::lower::routes::flatten_routes(app) {
-        let mut cur = Some(&route.controller);
-        let mut depth = 0;
-        while let Some(c) = cur {
-            out.entry(c.clone()).or_default().insert(route.action.clone());
-            depth += 1;
-            if depth > 16 {
-                break;
-            }
-            cur = parents.get(c).copied();
+        for c in ancestry.superclasses(&route.controller).into_iter().take(17) {
+            out.entry(c).or_default().insert(route.action.clone());
         }
     }
     out
@@ -6601,16 +6568,15 @@ pub(super) fn controller_concern_surfaces(app: &App) -> ControllerConcernSurface
         module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.clone());
     }
     let mut controllers = HashMap::default();
+    let ancestry = crate::ancestry::Ancestors::new(None, crate::ancestry::ControllerList::new(&app.controllers));
     for controller in &app.controllers {
         let mut direct_includes = Vec::new();
         let mut inherited = Vec::new();
         let mut instance_methods = crate::det::HashSet::default();
-        let mut cur = Some(controller);
-        let mut seen = crate::det::HashSet::default();
-        while let Some(c) = cur {
-            if !seen.insert(&c.name) {
-                break;
-            }
+        let chain = ancestry.superclasses(&controller.name);
+        let controller_chain = std::iter::once(controller)
+            .chain(chain.iter().skip(1).map_while(|p| app.controllers.iter().find(|o| o.name == *p)));
+        for c in controller_chain {
             for inc in crate::analyze::controller_includes(c) {
                 if c.name != controller.name && !inherited.contains(&inc) {
                     inherited.push(inc.clone());
@@ -6620,7 +6586,6 @@ pub(super) fn controller_concern_surfaces(app: &App) -> ControllerConcernSurface
                 }
             }
             instance_methods.extend(c.actions().map(|a| a.name.clone()));
-            cur = c.parent.as_ref().and_then(|p| app.controllers.iter().find(|o| &o.name == p));
         }
         controllers.insert(controller.name.clone(), ControllerConcernSurface {
             includes: filter_registration_order(&[direct_includes.clone()], &module_includes),

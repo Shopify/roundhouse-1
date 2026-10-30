@@ -741,42 +741,36 @@ const SIDEKIQ_CLASS_MACROS: &[&str] = &["sidekiq_options", "sidekiq_retry_in", "
 /// Library classes that include a Sidekiq worker module, or descend from
 /// one that does (mastodon's `UpdateDistributionWorker < RawDistributionWorker`).
 fn sidekiq_workers(app: &App) -> BTreeSet<String> {
-    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
-        app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
-    let mut out = BTreeSet::new();
-    for lc in &app.library_classes {
-        let mut cur = Some(lc);
-        for _ in 0..32 {
-            let Some(c) = cur else { break };
-            if c.includes.iter().any(|inc| SIDEKIQ_MODULES.contains(&inc.0.as_str())) {
-                out.insert(lc.name.0.as_str().to_string());
-                break;
-            }
-            cur = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
-        }
-    }
-    out
+    let chains = library_chains(app);
+    app.library_classes
+        .iter()
+        .filter(|lc| chains(&lc.name).iter().any(|c| c.includes.iter().any(|inc| SIDEKIQ_MODULES.contains(&inc.0.as_str()))))
+        .map(|lc| lc.name.0.as_str().to_string())
+        .collect()
+}
+
+/// `name`'s library class and its library-class ancestors, nearest first,
+/// at most 32, as each records its superclass (`crate::ancestry`).
+fn library_chains<'a>(app: &'a App) -> impl Fn(&crate::ident::ClassId) -> Vec<&'a crate::dialect::LibraryClass> + 'a {
+    let by_name: crate::det::HashMap<&crate::ident::ClassId, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().map(|lc| (&lc.name, lc)).collect();
+    let ancestry = crate::ancestry::Ancestors::new(None, crate::ancestry::LibraryList::new(&app.library_classes));
+    move |name| ancestry.superclasses(name).iter().take(32).map_while(|class| by_name.get(class).copied()).collect()
 }
 
 fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<String> {
-    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
-        app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
+    let chains = library_chains(app);
     let mut out = BTreeSet::new();
     for name in workers {
-        let mut cur = by_name.get(name.as_str()).copied();
-        for _ in 0..32 {
-            let Some(c) = cur else { break };
-            let perform = c.methods.iter().find(|m| {
-                m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform"
-            });
-            if let Some(m) = perform {
-                // A rest parameter is excluded because the wrapper forwards it as one Array argument, not splatted.
-                if m.block_param.is_none() && !m.params.iter().any(|p| p.forwarding || p.keyword || p.rest) {
-                    out.insert(name.clone());
-                }
-                break;
-            }
-            cur = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
+        let perform = chains(&crate::ident::ClassId(crate::ident::Symbol::from(name.as_str()))).into_iter().find_map(|c| {
+            c.methods.iter().find(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform")
+        });
+        // A rest parameter is excluded because the wrapper forwards it as one Array argument, not splatted.
+        if let Some(m) = perform
+            && m.block_param.is_none()
+            && !m.params.iter().any(|p| p.forwarding || p.keyword || p.rest)
+        {
+            out.insert(name.clone());
         }
     }
     out
@@ -871,23 +865,15 @@ fn workers_with_any_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<S
 }
 
 fn without_delayed_enqueue_overrides(app: &App, wrapped: &BTreeSet<String>) -> BTreeSet<String> {
-    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
-        app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
+    let chains = library_chains(app);
     wrapped
         .iter()
         .filter(|name| {
-            let mut cur = by_name.get(name.as_str()).copied();
-            for _ in 0..32 {
-                let Some(c) = cur else { break };
-                if c.methods.iter().any(|m| {
-                    m.receiver == crate::dialect::MethodReceiver::Class
-                        && matches!(m.name.as_str(), "perform_in" | "perform_at")
-                }) {
-                    return false;
-                }
-                cur = c.parent.as_ref().and_then(|p| by_name.get(p.0.as_str()).copied());
-            }
-            true
+            !chains(&crate::ident::ClassId(crate::ident::Symbol::from(name.as_str()))).into_iter().any(|c| {
+                c.methods.iter().any(|m| {
+                    m.receiver == crate::dialect::MethodReceiver::Class && matches!(m.name.as_str(), "perform_in" | "perform_at")
+                })
+            })
         })
         .cloned()
         .collect()

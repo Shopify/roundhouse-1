@@ -570,18 +570,15 @@ impl<'a> RestReach<'a> {
             .any(|part| part == "vendor" || part == "gems" || self.installed.contains(part))
     }
 
-    /// The receiver's superclass chain as modeled and as written, and
-    /// whether it continues past what the app models. `None` when a
-    /// written superclass may be an unmodeled app constant.
+    /// The receiver's superclass chain as modeled, and whether it
+    /// continues past what the app models. `None` when a superclass may
+    /// be an unmodeled app constant. Each parent is the name Ruby binds
+    /// (`ingest::written_names`), walked by `crate::ancestry`.
     fn superclass_chain(&self, contracts: &SourceContractIndex<'_>, receiver: &ClassId) -> Option<(Vec<String>, bool)> {
         let mut names = Vec::new();
         let mut open = false;
-        let mut pending = vec![receiver.clone()];
-        let mut seen = HashSet::default();
-        while let Some(node) = pending.pop() {
-            if !seen.insert(node.clone()) {
-                continue;
-            }
+        let links = crate::ancestry::ParentLinks(|id: &ClassId| contracts.parent(id).cloned());
+        for node in crate::ancestry::Ancestors::new(None, links).superclasses(receiver) {
             names.push(node.0.as_str().to_string());
             if self.synthesized.contains(&node) {
                 open = true;
@@ -592,28 +589,13 @@ impl<'a> RestReach<'a> {
                 }
                 continue;
             };
-            let written = parent.0.as_str().trim_start_matches("::");
-            if self.constants.contains(last_segment(written)) {
+            let parent = parent.0.as_str().trim_start_matches("::");
+            if self.constants.contains(last_segment(parent)) {
                 return None;
             }
-            names.push(written.to_string());
-            // Ruby resolves the spelling innermost scope first; follow
-            // every modeled candidate. The chain is open unless the
-            // top-level spelling itself is modeled: a compact `class
-            // A::B < P` resolves `P` at the top level only.
-            let mut scope: Vec<&str> = node.0.as_str().split("::").collect();
-            scope.pop();
-            let mut candidates = Vec::new();
-            while !scope.is_empty() {
-                candidates.push(ClassId(Symbol::from(format!("{}::{written}", scope.join("::")))));
-                scope.pop();
-            }
-            let top = ClassId(Symbol::from(written));
-            if !contracts.fragments.contains_key(&top) {
+            if !contracts.fragments.contains_key(&ClassId(Symbol::from(parent))) {
                 open = true;
             }
-            candidates.push(top);
-            pending.extend(candidates.into_iter().filter(|c| contracts.fragments.contains_key(c)));
         }
         Some((names, open))
     }

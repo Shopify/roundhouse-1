@@ -1083,29 +1083,23 @@ impl<'a> BodyTyper<'a> {
         if own.has_class_method(method) {
             return None;
         }
-        let mut current = own.parent.clone();
-        for _ in 0..32 {
-            let id = current?;
+        for id in self.ancestry().superclasses(of).into_iter().skip(1).take(32) {
             let cls = self.classes().get(&id)?;
             if cls.table.is_some() && cls.has_class_method(method) {
                 return Some(id);
             }
-            current = cls.parent.clone();
         }
         None
     }
 
     fn defines_instance_method(&self, of: &ClassId, method: &Symbol) -> bool {
-        let mut current = Some(of.clone());
-        for _ in 0..32 {
-            let Some(id) = current else { return false };
+        for id in self.ancestry().superclasses(of).into_iter().take(32) {
             let Some(cls) = self.classes().get(&id) else { return false };
             if cls.instance_methods.contains_key(method)
                 || cls.includes.iter().any(|m| self.lookup_in_module(m, method).is_some())
             {
                 return true;
             }
-            current = cls.parent.clone();
         }
         false
     }

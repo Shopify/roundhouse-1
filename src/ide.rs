@@ -221,19 +221,9 @@ pub fn defs_at(app: &App, file: FileId, offset: u32) -> Vec<DefSite<'_>> {
 /// parent). Class-side and instance-side are distinguished.
 pub fn def_of<'a>(app: &'a App, owner: &ClassId, name: &Symbol, class_side: bool) -> Option<DefSite<'a>> {
     let sites = def_sites(app);
-    let mut cur = Some(owner.clone());
-    let mut guard = 0;
-    while let Some(id) = cur {
-        if let Some(d) = sites.iter().find(|d| d.owner == id && &d.name == name && d.class_side == class_side) {
-            return Some(d.clone());
-        }
-        guard += 1;
-        if guard > 32 {
-            break;
-        }
-        cur = find_controller(app, &id).and_then(|c| parent_of(app, c)).map(|p| p.name.clone());
-    }
-    None
+    let mut owners = vec![owner.clone()];
+    owners.extend(controller_chain(app, owner).into_iter().skip(1).map(|c| c.name.clone()));
+    owners.iter().find_map(|id| sites.iter().find(|d| d.owner == *id && &d.name == name && d.class_side == class_side).cloned())
 }
 
 /// The hover for a header: `def name(params) -> Ret` from the stamped
@@ -477,16 +467,11 @@ pub fn members_of(
     side: MemberSide,
 ) -> Vec<Member> {
     let mut out: HashMap<Symbol, Member> = HashMap::default();
-    // Own class first, then includes, then up the parent chain (BFS via
-    // pop_front so includes are consulted before the parent, mirroring
-    // dispatch) — insert-if-absent makes the nearest definition win.
-    let mut queue: std::collections::VecDeque<&ClassId> = std::collections::VecDeque::new();
-    queue.push_back(class_id);
-    let mut visited: HashSet<&ClassId> = HashSet::default();
-    while let Some(id) = queue.pop_front() {
-        if !visited.insert(id) {
-            continue;
-        }
+    // In Ruby's ancestor order (`crate::ancestry`): the class, its
+    // included modules (the last one first), then up the superclass
+    // chain. Insert-if-absent makes the nearest definition win.
+    let ancestors = crate::ancestry::Ancestors::new(app.const_resolver.prepared(), registry).of(class_id);
+    for id in &ancestors {
         let Some(cls) = registry.get(id) else { continue };
 
         // Model metadata for kind classification: association and scope
@@ -550,13 +535,6 @@ pub fn members_of(
                     add(name, Some(ty), kind);
                 }
             }
-        }
-
-        for inc in &cls.includes {
-            queue.push_back(inc);
-        }
-        if let Some(parent) = &cls.parent {
-            queue.push_back(parent);
         }
     }
 
@@ -2049,33 +2027,12 @@ pub fn traceroute(app: &App, query: &str) -> Option<Trace> {
             push(&rf.defined_in, &mut out);
             push(&rf.included_via, &mut out);
         }
-        let mut cur = Some(controller);
-        let mut guard = 0;
-        while let Some(c) = cur {
-            push(&c.name, &mut out);
-            for inc in crate::analyze::controller_includes(c) {
-                push(&inc, &mut out);
-            }
-            guard += 1;
-            if guard > 32 {
-                break;
-            }
-            cur = parent_of(app, c);
-        }
-        // Close over concern-includes-concern (SignatureAuthentication
-        // includes SignatureVerification, which defines the method a
-        // controller's filter names) — mirror analyze's mixed_in
-        // closure.
-        let mut qi = 0;
-        while qi < out.len() {
-            let m = out[qi].clone();
-            qi += 1;
-            let Some(lc) = app.library_classes.iter().find(|lc| lc.name == m) else {
-                continue;
-            };
-            for inc in &lc.includes {
-                push(inc, &mut out);
-            }
+        // The controller's ancestors, concerns included concern by
+        // concern (SignatureAuthentication includes SignatureVerification,
+        // which defines the method a controller's filter names).
+        let ancestry = crate::ancestry::Ancestors::for_app(app);
+        for id in ancestry.of(&controller.name).iter().filter(|id| ancestry.app_defines(id)) {
+            push(id, &mut out);
         }
         out
     };
@@ -2397,35 +2354,27 @@ fn find_controller<'a>(app: &'a App, id: &ClassId) -> Option<&'a crate::dialect:
     app.controllers.iter().find(|c| &c.name == id)
 }
 
-/// The action's defining controller, walking the parent chain
-/// (nearest-first) for inherited actions. Single-segment parents are
-/// qualified against the child's namespace, mirroring analyze's
-/// lexical resolution.
+/// The action's defining controller, nearest first through its
+/// controller ancestors for inherited actions.
 fn find_action<'a>(
     app: &'a App,
     controller: &'a crate::dialect::Controller,
     action: &Symbol,
 ) -> Option<(&'a ClassId, &'a crate::dialect::Action)> {
-    let mut current = controller;
-    let mut guard = 0;
-    loop {
-        if let Some(a) = current.actions().find(|a| &a.name == action) {
-            return Some((&current.name, a));
-        }
-        guard += 1;
-        if guard > 32 {
-            return None;
-        }
-        current = parent_of(app, current)?;
-    }
+    std::iter::once(controller)
+        .chain(controller_chain(app, &controller.name).into_iter().skip(1))
+        .find_map(|current| current.actions().find(|a| &a.name == action).map(|a| (&current.name, a)))
 }
 
-/// The parent controller. Ingest stored the parent as Rubydex resolved it.
-fn parent_of<'a>(
-    app: &'a App,
-    controller: &'a crate::dialect::Controller,
-) -> Option<&'a crate::dialect::Controller> {
-    find_controller(app, controller.parent.as_ref()?)
+/// `owner` and its controller ancestors, nearest first (`crate::ancestry`):
+/// the chain stops at the first superclass that is not an app controller.
+fn controller_chain<'a>(app: &'a App, owner: &ClassId) -> Vec<&'a crate::dialect::Controller> {
+    crate::ancestry::Ancestors::new(app.const_resolver.prepared(), crate::ancestry::ControllerList::scan(&app.controllers))
+        .superclasses(owner)
+        .iter()
+        .take(33)
+        .map_while(|id| find_controller(app, id))
+        .collect()
 }
 
 /// The IR body of `class_id#method`, if ingested — controllers keep

@@ -90,14 +90,14 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
     let mut gid_signed: BTreeSet<Symbol> = BTreeSet::new();
     let materialized = super::assoc_pluck::materialized_assoc_names(app);
     let try_definers = super::try_guard::collect_definers(app);
-    let try_parents = super::try_guard::collect_parents(app);
+    let try_ancestries = super::try_guard::collect_ancestries(app);
 
     super::for_each_hook_body(app, &mut |body| {
         walk_postorder(body, &mut |e| {
             super::time_current::rewrite_node(e, &formats, zone_port);
             super::global_id_locate::rewrite_node(e, &mut gid_models, &mut gid_signed);
             super::assoc_pluck::rewrite_node(e, &materialized);
-            super::try_guard::rewrite_node(e, &try_definers, &try_parents);
+            super::try_guard::rewrite_node(e, &try_definers, &try_ancestries);
         });
     });
     super::for_each_test_body(app, &mut |body| {
@@ -107,7 +107,7 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
             // Same Array wall as hook bodies: campfire's destroy test
             // plucks `room.memberships` for the enqueued job's args.
             super::assoc_pluck::rewrite_node(e, &materialized);
-            super::try_guard::rewrite_node(e, &try_definers, &try_parents);
+            super::try_guard::rewrite_node(e, &try_definers, &try_ancestries);
         });
     });
     // `try_guard` also rewrites test constants and inner-class methods,
@@ -118,14 +118,14 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
     for tm in &mut app.test_modules {
         for (_, value) in &mut tm.constants {
             walk_postorder(value, &mut |e| {
-                super::try_guard::rewrite_node(e, &try_definers, &try_parents);
+                super::try_guard::rewrite_node(e, &try_definers, &try_ancestries);
             });
         }
         for ic in &mut tm.inner_classes {
             for m in &mut ic.methods {
                 walk_postorder(&mut m.body, &mut |e| {
                     super::webmock::rewrite_node(e);
-                    super::try_guard::rewrite_node(e, &try_definers, &try_parents);
+                    super::try_guard::rewrite_node(e, &try_definers, &try_ancestries);
                 });
             }
         }
@@ -133,7 +133,7 @@ pub fn apply_fused_context_rewrites(app: &mut App) {
     for view in &mut app.views {
         walk_postorder(&mut view.body, &mut |e| {
             super::global_id_locate::rewrite_node(e, &mut gid_models, &mut gid_signed);
-            super::try_guard::rewrite_node(e, &try_definers, &try_parents);
+            super::try_guard::rewrite_node(e, &try_definers, &try_ancestries);
         });
     }
 

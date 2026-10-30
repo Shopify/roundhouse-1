@@ -140,8 +140,9 @@ pub(crate) struct ConstResolver {
     /// Whether the PostgreSQL runtime's test-tree ports were indexed
     /// (`App::carries_postgresql_runtime`).
     postgresql_runtime: bool,
-    /// Complete, canonical ancestry from the same graph, for source admission.
-    class_ancestry: HashMap<ClassId, Vec<ClassId>>,
+    /// Every source class's and module's ancestry, as Rubydex linearized
+    /// it (`crate::ancestry` reads it).
+    ancestry: HashMap<ClassId, Ancestry>,
 }
 
 fn is_indexed(source: &SourceFile) -> bool {
@@ -493,6 +494,136 @@ fn lexical_nesting(graph: &Graph, mut name_id: NameId) -> Vec<Box<str>> {
     nesting
 }
 
+/// One class's or module's ancestry, as Rubydex linearized it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Ancestry {
+    pub(crate) is_module: bool,
+    /// Ruby's `ancestors`, nearest first: prepended modules, the
+    /// namespace itself, its included modules, then its superclass's.
+    /// Only the links Rubydex resolved; see `complete`.
+    pub(crate) instance: Vec<ClassId>,
+    /// The singleton class's ancestors, nearest first, when Rubydex has
+    /// a singleton class for the namespace.
+    pub(crate) singleton: Option<Vec<SingletonAncestor>>,
+    /// The superclass Ruby binds, for a class that writes one.
+    pub(crate) superclass: Option<ClassId>,
+    /// The namespace's own `include`, `prepend` and `extend` targets, in
+    /// source order.
+    pub(crate) includes: Vec<ClassId>,
+    pub(crate) prepends: Vec<ClassId>,
+    pub(crate) extends: Vec<ClassId>,
+    /// Whether every link resolved. A superclass or mixin only a gem
+    /// defines leaves the chain partial.
+    pub(crate) complete: bool,
+}
+
+/// One entry of a singleton class's ancestors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SingletonAncestor {
+    /// The singleton class of this class or module.
+    Of(ClassId),
+    /// An extended module, or a class or module of the chain past the
+    /// singleton classes (`Class`, `Module`, `Object`).
+    Module(ClassId),
+}
+
+fn namespace_id(declaration: &Declaration) -> ClassId {
+    ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))
+}
+
+fn collect_ancestry(graph: &Graph) -> HashMap<ClassId, Ancestry> {
+    let attached = |declaration: &Declaration| -> Option<ClassId> {
+        let owner = declaration.as_namespace()?.owner_id();
+        graph.declarations().get(owner).filter(|owner| owner.as_namespace().is_some()).map(namespace_id)
+    };
+    graph.declarations().values().filter_map(|declaration| {
+        let namespace = declaration.as_namespace()?;
+        let is_module = match namespace.kind() {
+            "Class" => false,
+            "Module" => true,
+            _ => return None,
+        };
+        let own = namespace_id(declaration);
+        // Rubydex lists the namespace itself after its prepended modules,
+        // as Ruby's `ancestors` does; keep that position rather than
+        // forcing it first.
+        let mut instance = Vec::new();
+        let mut classes = Vec::new();
+        let mut complete = matches!(namespace.ancestors(), Ancestors::Complete(_) | Ancestors::Cyclic(_));
+        for ancestor in namespace.ancestors() {
+            // Mutation reachability needs the known edges even when a gem
+            // superclass leaves the rest of the ancestry incomplete.
+            let Ancestor::Complete(id) = ancestor else {
+                complete = false;
+                continue;
+            };
+            let Some(ancestor) = graph.declarations().get(id) else { continue };
+            if matches!(ancestor.kind(), "Class" | "Module") {
+                let id = namespace_id(ancestor);
+                if !instance.contains(&id) {
+                    classes.push(ancestor.kind() == "Class");
+                    instance.push(id);
+                }
+            }
+        }
+        if !instance.contains(&own) {
+            instance.insert(0, own.clone());
+            classes.insert(0, !is_module);
+        }
+        let at = instance.iter().position(|id| *id == own).unwrap_or(0);
+        // Only a superclass a definition writes: Ruby's implicit `Object`
+        // is not the class's written parent.
+        let writes_superclass = declaration.definitions().iter().any(|definition| {
+            matches!(graph.definitions().get(definition), Some(Definition::Class(class)) if class.superclass_ref().is_some())
+        });
+        let superclass = if is_module || !writes_superclass {
+            None
+        } else {
+            (at + 1..instance.len()).find(|&index| classes[index]).map(|index| instance[index].clone())
+        };
+        let (mut includes, mut prepends, mut extends) = (Vec::new(), Vec::new(), Vec::new());
+        for definition in declaration.definitions() {
+            let mixins = match graph.definitions().get(definition) {
+                Some(Definition::Class(class)) => class.mixins(),
+                Some(Definition::Module(module)) => module.mixins(),
+                _ => continue,
+            };
+            for mixin in mixins {
+                let Some(reference) = graph.constant_references().get(mixin.constant_reference_id()) else { continue };
+                let Some(target) = resolved_namespace(graph, *reference.name_id()) else { continue };
+                let (list, target) = match mixin {
+                    rubydex::model::definitions::Mixin::Include(_) => (&mut includes, namespace_id(target)),
+                    rubydex::model::definitions::Mixin::Prepend(_) => (&mut prepends, namespace_id(target)),
+                    rubydex::model::definitions::Mixin::Extend(_) => (&mut extends, namespace_id(target)),
+                };
+                if !list.contains(&target) {
+                    list.push(target);
+                }
+            }
+        }
+        let singleton = namespace.singleton_class().and_then(|id| graph.declarations().get(id)?.as_namespace()).map(|singleton| {
+            let mut chain: Vec<SingletonAncestor> = Vec::new();
+            for ancestor in singleton.ancestors() {
+                let Ancestor::Complete(id) = ancestor else { continue };
+                let Some(ancestor) = graph.declarations().get(id) else { continue };
+                let entry = match ancestor.kind() {
+                    "SingletonClass" => match attached(ancestor) {
+                        Some(of) => SingletonAncestor::Of(of),
+                        None => continue,
+                    },
+                    "Class" | "Module" => SingletonAncestor::Module(namespace_id(ancestor)),
+                    _ => continue,
+                };
+                if !chain.contains(&entry) {
+                    chain.push(entry);
+                }
+            }
+            chain
+        });
+        Some((own, Ancestry { is_module, instance, singleton, superclass, includes, prepends, extends, complete }))
+    }).collect()
+}
+
 fn resolved_namespace(graph: &Graph, name: NameId) -> Option<&Declaration> {
     let id = graph.name_id_to_declaration_id(name)?;
     let id = graph.resolve_alias(id).unwrap_or(*id);
@@ -531,28 +662,7 @@ impl ConstResolver {
         // Rubydex resolves all source references after every file enters
         // its graph, including declarations in later files.
         crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
-        // Match ingest and reference answers even for singleton-class nesting.
-        let class_ancestry = graph.declarations().values().filter_map(|declaration| {
-            let namespace = declaration.as_namespace()?;
-            if namespace.kind() != "Class" { return None; }
-            let own = ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()));
-            // Rubydex lists the class itself after its prepended modules, as
-            // Ruby's `ancestors` does; keep that position rather than forcing
-            // the class first.
-            let mut ancestors = Vec::new();
-            for ancestor in namespace.ancestors() {
-                // Mutation reachability needs the known edges even when a
-                // gem superclass leaves the rest of the ancestry incomplete.
-                let Ancestor::Complete(id) = ancestor else { continue };
-                let Some(ancestor) = graph.declarations().get(id) else { continue };
-                if matches!(ancestor.kind(), "Class" | "Module") {
-                    let id = ClassId(Symbol::from(hoisted_name(ancestor.name()).as_ref()));
-                    if !ancestors.contains(&id) { ancestors.push(id); }
-                }
-            }
-            if !ancestors.contains(&own) { ancestors.insert(0, own.clone()); }
-            Some((own, ancestors))
-        }).collect();
+        let ancestry = crate::timings::phase("rubydex: ancestry", || collect_ancestry(&graph));
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
         let stdlib_namespaces = stdlib_namespaces(&graph);
         drop(graph);
@@ -603,7 +713,7 @@ impl ConstResolver {
             namespace_aliases,
             source_fingerprint: source_fingerprint(sources),
             postgresql_runtime,
-            class_ancestry,
+            ancestry,
         }
     }
 
@@ -837,7 +947,12 @@ impl ConstResolver {
     }
 
     pub(in crate::analyze) fn class_ancestry(&self, name: &ClassId) -> Option<&[ClassId]> {
-        self.class_ancestry.get(name).map(Vec::as_slice)
+        self.ancestry.get(name).filter(|ancestry| !ancestry.is_module).map(|ancestry| ancestry.instance.as_slice())
+    }
+
+    /// The ancestry Rubydex linearized for the class or module `name`.
+    pub(crate) fn ancestry(&self, name: &ClassId) -> Option<&Ancestry> {
+        self.ancestry.get(name)
     }
 }
 
@@ -864,6 +979,13 @@ impl PreparedConstResolver {
     #[cfg(test)]
     pub(crate) fn for_sources(&self, sources: &[SourceFile]) -> Arc<ConstResolver> {
         self.for_sources_with(sources, false)
+    }
+
+    /// The answers ingest prepared, not checked against the current
+    /// sources: for answers keyed by name, such as `ancestry`, which an
+    /// edit of a source's text after ingest does not move.
+    pub(crate) fn prepared(&self) -> Option<&ConstResolver> {
+        self.0.as_deref()
     }
 
     /// The answers for exactly the sources Rubydex indexed, which ingest

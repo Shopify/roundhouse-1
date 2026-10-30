@@ -36,11 +36,22 @@ pub fn apply_mailer_templates(app: &mut App) -> Vec<Diagnostic> {
     }
     let contracts = super::view_to_library::action_view_ivar_map(&app.views, &app.controllers, &app.models);
     let closures = super::view_to_library::view_ivar_closures(&app.views, &app.controllers);
-    let parents: HashMap<String, Option<String>> = app
-        .library_classes
-        .iter()
-        .map(|lc| (lc.name.0.as_str().to_string(), lc.parent.as_ref().map(|p| p.0.as_str().to_string())))
-        .collect();
+    // Each mailer and its mailer ancestors, nearest first.
+    let chains: HashMap<String, Vec<String>> = {
+        let ancestry = crate::ancestry::Ancestors::for_app(app);
+        mailers
+            .iter()
+            .map(|mailer| {
+                let chain = ancestry
+                    .superclasses(&crate::ident::ClassId(Symbol::from(mailer.as_str())))
+                    .into_iter()
+                    .map(|class| class.0.as_str().to_string())
+                    .take_while(|class| mailers.contains(class))
+                    .collect();
+                (mailer.clone(), chain)
+            })
+            .collect()
+    };
     let calls: HashMap<String, Vec<Expr>> = app
         .library_classes
         .iter()
@@ -59,7 +70,7 @@ pub fn apply_mailer_templates(app: &mut App) -> Vec<Diagnostic> {
         if !mailers.contains(&class) {
             continue;
         }
-        let chain = ancestry(&class, &parents, &mailers);
+        let chain = chains[&class].clone();
         let (defaults, layout) = class_settings(&chain, &calls, &mut diags);
         let layout = layout.unwrap_or_else(|| implied_layout(&chain, &has_view));
         let dir = view_dir(&class);
@@ -99,20 +110,6 @@ struct Site<'a> {
     closures: &'a HashMap<ViewKey, Vec<Symbol>>,
     views: &'a [(String, String, bool)],
     defaults: &'a [(Expr, Expr)],
-}
-
-/// The mailer and its mailer ancestors, nearest first.
-fn ancestry(class: &str, parents: &HashMap<String, Option<String>>, mailers: &BTreeSet<String>) -> Vec<String> {
-    let mut out = vec![class.to_string()];
-    let mut current = class.to_string();
-    while let Some(Some(parent)) = parents.get(&current) {
-        if !mailers.contains(parent) || out.contains(parent) {
-            break;
-        }
-        out.push(parent.clone());
-        current = parent.clone();
-    }
-    out
 }
 
 /// `default k: v` entries (a nearer class's key wins) and the nearest

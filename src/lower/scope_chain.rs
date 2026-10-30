@@ -160,19 +160,22 @@ pub fn build_scope_registry(models: &[Model]) -> ScopeRegistry {
         }
     }
     // Not only the model's own scopes: one declared on an abstract base answers on the subclass (`article.comments.approved`), the child's own declaration winning.
-    let parents: HashMap<ClassId, ClassId> =
-        models.iter().filter_map(|m| m.parent.clone().map(|p| (m.name.clone(), p))).collect();
+    let ancestry = crate::ancestry::Ancestors::new(None, crate::ancestry::ModelList::new(models));
     for m in models {
-        let mut current = parents.get(&m.name).cloned();
-        for _ in 0..32 {
-            let Some(p) = current else { break };
+        let parents: Vec<ClassId> = ancestry
+            .superclasses(&m.name)
+            .into_iter()
+            .skip(1)
+            .take(32)
+            .take_while(|parent| models.iter().any(|o| o.name == *parent))
+            .collect();
+        for p in parents {
             let inherited: Vec<(Symbol, Vec<Param>)> =
                 reg.get(&p).map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
             let own = reg.entry(m.name.clone()).or_default();
             for (name, params) in inherited {
                 own.entry(name).or_insert(params);
             }
-            current = parents.get(&p).cloned();
         }
     }
     reg

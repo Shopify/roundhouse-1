@@ -119,16 +119,15 @@ impl<'a> Lineage<'a> {
     /// [`type_names`] keeps.
     fn below(&self, subs: &crate::det::HashMap<ClassId, Symbol>) -> crate::det::HashMap<&'a ClassId, Vec<usize>> {
         let mut out: crate::det::HashMap<&ClassId, Vec<usize>> = crate::det::HashMap::default();
+        let ancestry = crate::ancestry::Ancestors::new(None, crate::ancestry::ParentLinks(|name: &ClassId| self.class(name)?.parent.clone()));
         for (j, lc) in self.app.library_classes.iter().enumerate() {
-            let mut cursor = lc.parent.as_ref();
-            let mut reached: Vec<&ClassId> = Vec::new();
-            for _ in 0..8 {
-                let Some(parent) = cursor else { break };
-                if subs.contains_key(parent) && !reached.contains(&parent) {
-                    reached.push(parent);
-                    out.entry(parent).or_default().push(j);
+            let Some(parent) = &lc.parent else { continue };
+            for parent in ancestry.superclasses(parent).into_iter().take(8) {
+                if subs.contains_key(&parent)
+                    && let Some(sub) = self.class(&parent)
+                {
+                    out.entry(&sub.name).or_default().push(j);
                 }
-                cursor = self.class(parent).and_then(|c| c.parent.as_ref());
             }
         }
         out
@@ -139,9 +138,9 @@ impl<'a> Lineage<'a> {
 /// it (`lc` first, the model last), through intermediate library classes.
 pub(crate) fn model_ancestry<'a>(lc: &LibraryClass, lineage: &Lineage<'a>) -> Option<(&'a Model, Vec<ClassId>)> {
     let mut chain = vec![lc.name.clone()];
-    let mut cursor = lc.parent.clone();
-    for _ in 0..8 {
-        let parent = cursor?;
+    let links = crate::ancestry::ParentLinks(|name: &ClassId| lineage.class(name)?.parent.clone());
+    let parent = lc.parent.as_ref()?;
+    for parent in crate::ancestry::Ancestors::new(None, links).superclasses(parent).into_iter().take(8) {
         if let Some(model) = lineage.model(&parent) {
             chain.push(model.name.clone());
             return Some((model, chain));
@@ -149,9 +148,8 @@ pub(crate) fn model_ancestry<'a>(lc: &LibraryClass, lineage: &Lineage<'a>) -> Op
         if chain.contains(&parent) {
             return None;
         }
-        let next = lineage.class(&parent)?;
+        lineage.class(&parent)?;
         chain.push(parent);
-        cursor = next.parent.clone();
     }
     None
 }

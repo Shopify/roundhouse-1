@@ -664,23 +664,19 @@ pub fn apply_i18n_translate_lowering(app: &mut App) {
 /// controller has no `t`) and neither it nor an app ancestor defines its
 /// own `t` / `translate`.
 fn translates(app: &App, controller: &crate::dialect::Controller) -> bool {
-    let by_name: crate::det::HashMap<&str, &crate::dialect::Controller> =
-        app.controllers.iter().map(|c| (c.name.0.as_str(), c)).collect();
-    let mut current = Some(controller);
-    for _ in 0..32 {
-        let Some(c) = current else { return false };
+    let by_name: crate::det::HashMap<&crate::ident::ClassId, &crate::dialect::Controller> =
+        app.controllers.iter().map(|c| (&c.name, c)).collect();
+    let chain = crate::ancestry::Ancestors::new(app.const_resolver.prepared(), crate::ancestry::ControllerList::scan(&app.controllers))
+        .above(controller.parent.as_ref());
+    let chain: Vec<&crate::ident::ClassId> = std::iter::once(&controller.name).chain(chain.iter()).collect();
+    for (at, class) in chain.into_iter().enumerate().take(33) {
+        if at > 0 && class.0.as_str() == "ActionController::Base" {
+            return true;
+        }
+        let Some(c) = (if at == 0 { Some(controller) } else { by_name.get(class).copied() }) else { return false };
         if c.actions().any(|a| matches!(a.name.as_str(), "t" | "translate")) {
             return false;
         }
-        let Some(parent) = c.parent.as_ref().map(|p| p.0.as_str()) else { return false };
-        if parent == "ActionController::Base" {
-            return true;
-        }
-        // A parent named as written may be relative to the child's namespace.
-        current = by_name.get(parent).copied().or_else(|| {
-            let ns = c.name.0.as_str().rsplit_once("::").map(|(ns, _)| ns)?;
-            by_name.get(format!("{ns}::{parent}").as_str()).copied()
-        });
     }
     false
 }

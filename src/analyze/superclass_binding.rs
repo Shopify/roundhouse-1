@@ -103,28 +103,15 @@ fn is_constant_segment(segment: &str) -> bool {
         && segment.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The registry's ancestors of `name`, excluding itself: its includes,
-/// the last one first, then its superclass chain, as recorded.
+/// The registry's ancestors of `name`, excluding itself, in Ruby's
+/// order (`crate::ancestry`): its includes, the last one first, then its
+/// superclass chain, as recorded.
 fn ancestors(name: &str, classes: &HashMap<ClassId, ClassInfo>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut stack: Vec<ClassId> = vec![ClassId(Symbol::from(name))];
-    let mut first = true;
-    while let Some(id) = stack.pop() {
-        if out.len() > 64 {
-            break;
-        }
-        if !first {
-            if out.iter().any(|seen| seen == id.0.as_str()) {
-                continue;
-            }
-            out.push(id.0.as_str().to_string());
-        }
-        first = false;
-        let Some(info) = classes.get(&id) else { continue };
-        // Pushed in reverse so the superclass is visited last and the
-        // last include first.
-        stack.extend(info.parent.iter().cloned());
-        stack.extend(info.includes.iter().cloned());
-    }
-    out
+    let id = ClassId(Symbol::from(name));
+    crate::ancestry::Ancestors::new(None, classes)
+        .of(&id)
+        .into_iter()
+        .filter(|ancestor| *ancestor != id)
+        .map(|ancestor| ancestor.0.as_str().to_string())
+        .collect()
 }

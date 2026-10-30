@@ -215,15 +215,10 @@ pub(crate) fn declares(model: &Model) -> bool {
 /// Whether `model` or a model ancestor declares one (an STI subclass
 /// inherits its parent's default scope, and the class methods with it).
 pub(crate) fn applies(model: &Model, models: &[Model]) -> bool {
-    let mut cursor = Some(model);
-    for _ in 0..16 {
-        let Some(m) = cursor else { return false };
-        if declares(m) {
-            return true;
-        }
-        cursor = m.parent.as_ref().and_then(|p| models.iter().find(|o| &o.name == p));
-    }
-    false
+    let chain = crate::ancestry::Ancestors::new(None, crate::ancestry::ModelList::scan(models)).above(model.parent.as_ref());
+    std::iter::once(model)
+        .chain(chain.iter().take(15).map_while(|parent| models.iter().find(|o| o.name == *parent)))
+        .any(declares)
 }
 
 /// Whether the STI subclass `lc` declares a reproduced default scope of
@@ -598,15 +593,12 @@ pub(crate) fn scoped_owner(
     registry: &crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
     owner: &ClassId,
 ) -> bool {
-    let mut cursor = Some(owner);
-    for _ in 0..16 {
-        let Some(info) = cursor.and_then(|c| registry.get(c)) else { return false };
-        if info.default_scoped {
-            return true;
-        }
-        cursor = info.parent.as_ref();
-    }
-    false
+    crate::ancestry::Ancestors::new(None, registry)
+        .superclasses(owner)
+        .iter()
+        .take(16)
+        .map_while(|class| registry.get(class))
+        .any(|info| info.default_scoped)
 }
 
 /// Whether a folded query preloads a default-scoped model: the folded

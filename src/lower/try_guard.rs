@@ -86,28 +86,28 @@ const MAX_ARMS: usize = 3;
 #[allow(dead_code)]
 pub fn apply_try_guard_lowering(app: &mut App) {
     let definers = collect_definers(app);
-    let parents = collect_parents(app);
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &definers, &parents));
+    let ancestries = collect_ancestries(app);
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &definers, &ancestries));
     // THE TEST TREE TOO, which `for_each_hook_body` does not reach — and
     // for this pass that is where the whole demand is. campfire's single
     // `try` site is in `turbo_test_helper.rb`, spliced into every test
     // class that asserts a broadcast; the app tree has none at all.
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
-            rewrite(setup, &definers, &parents);
+            rewrite(setup, &definers, &ancestries);
         }
         for t in &mut tm.tests {
-            rewrite(&mut t.body, &definers, &parents);
+            rewrite(&mut t.body, &definers, &ancestries);
         }
         for h in &mut tm.helpers {
-            rewrite(&mut h.body, &definers, &parents);
+            rewrite(&mut h.body, &definers, &ancestries);
         }
         for (_, value) in &mut tm.constants {
-            rewrite(value, &definers, &parents);
+            rewrite(value, &definers, &ancestries);
         }
         for ic in &mut tm.inner_classes {
             for m in &mut ic.methods {
-                rewrite(&mut m.body, &definers, &parents);
+                rewrite(&mut m.body, &definers, &ancestries);
             }
         }
     }
@@ -122,23 +122,23 @@ pub fn apply_try_guard_lowering(app: &mut App) {
     // files, and the AOT lane refused the same site as a non-bool
     // condition.
     for view in &mut app.views {
-        rewrite(&mut view.body, &definers, &parents);
+        rewrite(&mut view.body, &definers, &ancestries);
     }
 }
 
 fn rewrite(
     expr: &mut Expr,
     definers: &TryDefiners,
-    parents: &HashMap<Symbol, Symbol>,
+    ancestries: &HashMap<Symbol, Vec<Symbol>>,
 ) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, definers, parents));
-    rewrite_node(expr, definers, parents);
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, definers, ancestries));
+    rewrite_node(expr, definers, ancestries);
 }
 
 pub(crate) fn rewrite_node(
     expr: &mut Expr,
     definers: &TryDefiners,
-    parents: &HashMap<Symbol, Symbol>,
+    ancestries: &HashMap<Symbol, Vec<Symbol>>,
 ) {
     // The tree defines `Object#try` itself: the send is the behaviour.
     if definers.runtime_tryable {
@@ -184,7 +184,7 @@ pub(crate) fn rewrite_node(
     );
     call.ty = try_ty.clone();
 
-    let arms = if bang { None } else { narrowing(&name, definers, parents) };
+    let arms = if bang { None } else { narrowing(&name, definers, ancestries) };
     let mut replaced = match arms {
         // Nothing in the tree defines it and it is not `try!`: the only
         // answer `try` can give is nil. Folding rather than emitting a
@@ -248,7 +248,7 @@ pub(crate) fn rewrite_node(
 fn narrowing(
     name: &Symbol,
     definers: &HashMap<Symbol, HashSet<Symbol>>,
-    parents: &HashMap<Symbol, Symbol>,
+    ancestries: &HashMap<Symbol, Vec<Symbol>>,
 ) -> Option<Vec<Symbol>> {
     let Some(set) = definers.get(name) else {
         // The name is defined nowhere in the tree. It may still be a
@@ -277,7 +277,7 @@ fn narrowing(
     // base and answers nothing.
     let mut cover: Vec<Symbol> = Vec::new();
     for klass in set {
-        let base = highest_safe_ancestor(klass, set, parents);
+        let base = highest_safe_ancestor(klass, set, ancestries);
         if !cover.contains(&base) {
             cover.push(base);
             // The cover only grows, so once it is past the bound the
@@ -317,10 +317,10 @@ fn narrowing(
 fn highest_safe_ancestor(
     klass: &Symbol,
     set: &HashSet<Symbol>,
-    parents: &HashMap<Symbol, Symbol>,
+    ancestries: &HashMap<Symbol, Vec<Symbol>>,
 ) -> Symbol {
     let mut best = klass.clone();
-    for ancestor in ancestry(klass, parents) {
+    for ancestor in ancestry(klass, ancestries) {
         if set.contains(&ancestor) {
             best = ancestor;
         }
@@ -328,22 +328,10 @@ fn highest_safe_ancestor(
     best
 }
 
-/// `[self, parent, grandparent, ...]`, stopping at a name the tree does
-/// not define (`ActiveRecord::Base` is the runtime's, not an app
-/// class, so the chain ends before it).
-fn ancestry(name: &Symbol, parents: &HashMap<Symbol, Symbol>) -> Vec<Symbol> {
-    let mut out = vec![name.clone()];
-    let mut cur = name.clone();
-    // A malformed tree with a parent cycle must not hang the compiler.
-    let mut seen = HashSet::default();
-    while let Some(p) = parents.get(&cur) {
-        if !seen.insert(p.clone()) {
-            break;
-        }
-        out.push(p.clone());
-        cur = p.clone();
-    }
-    out
+/// `[self, parent, grandparent, ...]`, through the tree's own classes
+/// and the first name past them (`ActiveRecord::Base`, the runtime's).
+fn ancestry(name: &Symbol, ancestries: &HashMap<Symbol, Vec<Symbol>>) -> Vec<Symbol> {
+    ancestries.get(name).cloned().unwrap_or_else(|| vec![name.clone()])
 }
 
 fn is_a(span: crate::span::Span, recv: &Expr, klass: &Symbol) -> Expr {
@@ -457,22 +445,18 @@ fn definers_by_name(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
     out
 }
 
-/// class -> superclass, over models and library classes both. Empty
-/// where the tree answers `try` itself (`runtime_tryable`).
-pub(crate) fn collect_parents(app: &App) -> HashMap<Symbol, Symbol> {
+/// Each model's and library class's superclass chain (`ancestry`).
+/// Empty where the tree answers `try` itself (`runtime_tryable`).
+pub(crate) fn collect_ancestries(app: &App) -> HashMap<Symbol, Vec<Symbol>> {
     let mut out = HashMap::default();
     if runtime_tryable(app) {
         return out;
     }
-    for m in &app.models {
-        if let Some(p) = &m.parent {
-            out.insert(m.name.0.clone(), p.0.clone());
-        }
-    }
-    for lc in &app.library_classes {
-        if let Some(p) = &lc.parent {
-            out.insert(lc.name.0.clone(), p.0.clone());
-        }
+    let ancestry = crate::ancestry::Ancestors::for_app(app);
+    for name in app.models.iter().map(|m| &m.name).chain(app.library_classes.iter().map(|lc| &lc.name)) {
+        let chain = ancestry.superclasses(name);
+        let past = chain.iter().skip(1).position(|class| !ancestry.app_defines(class)).map_or(chain.len(), |at| at + 2);
+        out.insert(name.0.clone(), chain.into_iter().take(past).map(|class| class.0).collect());
     }
     out
 }

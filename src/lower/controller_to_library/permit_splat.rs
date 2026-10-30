@@ -54,22 +54,15 @@ fn symbol_list_of(
     name: &Symbol,
     by_name: &HashMap<&ClassId, &Controller>,
 ) -> Option<Vec<Expr>> {
-    let mut current = Some(controller);
-    let mut seen = 0;
-    while let Some(c) = current {
-        if let Some(def) = c.actions().filter(|a| &a.name == name).last() {
-            if !def.formal_params().is_empty() || def.block_param.is_some() {
-                return None;
-            }
-            return literal_symbols(&def.body);
-        }
-        seen += 1;
-        if seen > 32 {
-            return None;
-        }
-        current = c.parent.as_ref().and_then(|p| by_name.get(p).copied());
+    let links = crate::ancestry::ParentLinks(|id: &ClassId| by_name.get(id)?.parent.clone());
+    let chain = crate::ancestry::Ancestors::new(None, links).above(controller.parent.as_ref());
+    let def = std::iter::once(controller)
+        .chain(chain.iter().take(32).map_while(|parent| by_name.get(parent).copied()))
+        .find_map(|c| c.actions().filter(|a| &a.name == name).last())?;
+    if !def.formal_params().is_empty() || def.block_param.is_some() {
+        return None;
     }
-    None
+    literal_symbols(&def.body)
 }
 
 fn literal_symbols(body: &Expr) -> Option<Vec<Expr>> {

@@ -67,21 +67,12 @@ pub(crate) fn lineage(app: &App, views: &HashMap<ClassId, Model>, view: &Model) 
     if !transactional {
         return out;
     }
-    let mut cursor = view.parent.clone();
-    for _ in 0..16 {
-        let Some(name) = cursor else { break };
-        let next = match views.get(&name) {
-            Some(v) => v.clone(),
-            None => match app.models.iter().find(|m| m.name == name) {
-                Some(m) => m.clone(),
-                None => break,
-            },
-        };
-        if out.iter().any(|m| m.name == next.name) {
-            break;
-        }
-        cursor = next.parent.clone();
-        out.push(next);
+    let model = |name: &ClassId| views.get(name).or_else(|| app.models.iter().find(|m| m.name == *name));
+    let Some(parent) = view.parent.clone() else { return out };
+    let links = crate::ancestry::ParentLinks(|name: &ClassId| model(name)?.parent.clone());
+    for name in crate::ancestry::Ancestors::new(None, links).superclasses(&parent).into_iter().take(16) {
+        let Some(next) = model(&name) else { break };
+        out.push(next.clone());
     }
     out
 }

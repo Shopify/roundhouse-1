@@ -553,14 +553,9 @@ pub fn modelled_class_body_call(app: &App, lc: &LibraryClass, call: &Expr) -> bo
 /// The class, then its parents within the ingested set.
 fn ancestry<'a>(app: &'a App, lc: &'a LibraryClass) -> Vec<&'a LibraryClass> {
     let mut out = vec![lc];
-    let mut cursor = lc.parent.clone();
-    while let Some(p) = cursor {
-        if out.len() > 8 {
-            break;
-        }
-        let Some(parent) = app.library_classes.iter().find(|c| c.name == p) else { break };
+    for parent in crate::ancestry::Ancestors::for_list(app, &app.library_classes).above(lc.parent.as_ref()).iter().take(8) {
+        let Some(parent) = app.library_classes.iter().find(|c| c.name == *parent) else { break };
         out.push(parent);
-        cursor = parent.parent.clone();
     }
     out
 }

@@ -142,15 +142,11 @@ fn own_inheritance_column(model: &crate::dialect::Model) -> Option<String> {
 /// to `nil`; a name the table lacks (`:_type_disabled`) disables STI
 /// just as well, since [`sti_bases`] asks the table for it.
 pub(crate) fn inheritance_column(model: &crate::dialect::Model, models: &[crate::dialect::Model]) -> String {
-    let mut cursor = Some(model);
-    for _ in 0..16 {
-        let Some(m) = cursor else { break };
-        if let Some(col) = own_inheritance_column(m) {
-            return col;
-        }
-        cursor = m.parent.as_ref().and_then(|p| models.iter().find(|o| &o.name == p));
-    }
-    INHERITANCE_COLUMN.to_string()
+    let chain = crate::ancestry::Ancestors::new(None, crate::ancestry::ModelList::scan(models)).above(model.parent.as_ref());
+    std::iter::once(model)
+        .chain(chain.iter().take(15).map_while(|parent| models.iter().find(|o| o.name == *parent)))
+        .find_map(own_inheritance_column)
+        .unwrap_or_else(|| INHERITANCE_COLUMN.to_string())
 }
 
 /// `def self.inheritance_column = "kind"` on a model that sets it (Ruby
@@ -234,23 +230,14 @@ pub(crate) fn apply_plain_subclass_hydration(lcs: &mut [crate::dialect::LibraryC
 pub(crate) fn plain_model_subclasses(app: &App) -> HashMap<ClassId, ClassId> {
     let sti = sti_bases(app);
     let models: HashSet<&ClassId> = app.models.iter().map(|m| &m.name).collect();
-    let mut lc_parent: HashMap<&ClassId, &Option<ClassId>> = HashMap::default();
-    for other in &app.library_classes {
-        lc_parent.entry(&other.name).or_insert(&other.parent);
-    }
+    let ancestry = crate::ancestry::Ancestors::for_app(app);
     let mut out = HashMap::default();
     for lc in &app.library_classes {
         if sti.contains_key(&lc.name) || models.contains(&lc.name) {
             continue;
         }
-        let mut cursor = lc.parent.clone();
-        for _ in 0..8 {
-            let Some(parent) = cursor else { break };
-            if models.contains(&parent) {
-                out.insert(lc.name.clone(), parent);
-                break;
-            }
-            cursor = lc_parent.get(&parent).and_then(|p| (*p).clone());
+        if let Some(model) = ancestry.superclasses(&lc.name).into_iter().skip(1).take(8).find(|parent| models.contains(parent)) {
+            out.insert(lc.name.clone(), model);
         }
     }
     out
@@ -640,19 +627,12 @@ pub(crate) fn sti_bases(app: &App) -> HashMap<ClassId, ClassId> {
     for m in &app.models {
         models_by_name.entry(&m.name).or_insert(m);
     }
-    let mut lc_parent: HashMap<&ClassId, &Option<ClassId>> = HashMap::default();
-    for other in &app.library_classes {
-        lc_parent.entry(&other.name).or_insert(&other.parent);
-    }
     let model_named = |id: &ClassId| models_by_name.get(id).copied();
+    let ancestry = crate::ancestry::Ancestors::for_app(app);
     for lc in &app.library_classes {
-        let mut cursor = lc.parent.clone();
-        let mut hops = 0;
-        while let Some(parent) = cursor {
-            if hops > 8 {
-                break;
-            }
-            if let Some(base) = model_named(&parent) {
+        let base = ancestry.superclasses(&lc.name).into_iter().skip(1).take(9).find_map(|parent| model_named(&parent));
+        if let Some(base) = base {
+            {
                 let column = inheritance_column(base, &app.models);
                 let has_type = !column.is_empty()
                     && app
@@ -663,10 +643,7 @@ pub(crate) fn sti_bases(app: &App) -> HashMap<ClassId, ClassId> {
                 if has_type {
                     out.insert(lc.name.clone(), base.name.clone());
                 }
-                break;
             }
-            cursor = lc_parent.get(&parent).and_then(|p| (*p).clone());
-            hops += 1;
         }
     }
     out
@@ -724,21 +701,14 @@ pub(crate) fn runtime_sti_named(app: &App) -> HashSet<ClassId> {
         found
     };
     let class_override = |m: &MethodDef| m.receiver == MethodReceiver::Class && OVERRIDES.contains(&m.name.as_str());
-    let mut parent_of: HashMap<&ClassId, &ClassId> = HashMap::default();
     let mut own: HashMap<&ClassId, bool> = HashMap::default();
     for lc in &app.library_classes {
-        if let Some(p) = &lc.parent {
-            parent_of.entry(&lc.name).or_insert(p);
-        }
         let named = lc.methods.iter().any(class_override)
             || lc.unknown_calls.iter().any(renames)
             || lc.class_ivar_initializers.iter().any(renames);
         *own.entry(&lc.name).or_insert(false) |= named;
     }
     for m in &app.models {
-        if let Some(p) = &m.parent {
-            parent_of.entry(&m.name).or_insert(p);
-        }
         let named = m.methods().any(class_override)
             || m.body.iter().any(|item| match item {
                 crate::dialect::ModelBodyItem::Unknown { expr, .. }
@@ -750,15 +720,10 @@ pub(crate) fn runtime_sti_named(app: &App) -> HashSet<ClassId> {
     // A hierarchy is its base model, the base's ancestors and every
     // subclass; any one of them renaming makes them all runtime-named.
     let mut renamed_bases: HashSet<&ClassId> = HashSet::default();
+    let ancestry = crate::ancestry::Ancestors::for_app(app);
     for (sub, base) in &bases {
-        let mut chain = vec![sub];
-        let mut cursor = parent_of.get(sub).copied();
-        for _ in 0..12 {
-            let Some(p) = cursor else { break };
-            chain.push(p);
-            cursor = parent_of.get(p).copied();
-        }
-        if chain.iter().any(|c| own.get(*c).copied().unwrap_or(false)) {
+        let chain = ancestry.superclasses(sub).into_iter().take(13).collect::<Vec<_>>();
+        if chain.iter().any(|c| own.get(c).copied().unwrap_or(false)) {
             renamed_bases.insert(base);
         }
     }
@@ -812,11 +777,7 @@ fn type_value_name(e: &Expr) -> Option<String> {
 /// class below it (`GoldBadge` -> `GoldBadge`, `PlatinumBadge`), the
 /// `type IN (...)` Rails' `type_condition` writes from `descendants`.
 fn type_names(app: &App, bases: &HashMap<ClassId, ClassId>) -> HashMap<ClassId, Vec<String>> {
-    let parent_of: HashMap<&ClassId, &ClassId> = app
-        .library_classes
-        .iter()
-        .filter_map(|lc| lc.parent.as_ref().map(|p| (&lc.name, p)))
-        .collect();
+    let ancestry = crate::ancestry::Ancestors::for_app(app);
     let mut out: HashMap<ClassId, Vec<String>> = HashMap::default();
     for lc in &app.library_classes {
         if !bases.contains_key(&lc.name) || out.contains_key(&lc.name) {
@@ -827,17 +788,11 @@ fn type_names(app: &App, bases: &HashMap<ClassId, ClassId>) -> HashMap<ClassId, 
             if other.name == lc.name || !bases.contains_key(&other.name) {
                 continue;
             }
-            let mut cursor = parent_of.get(&other.name).copied();
-            for _ in 0..8 {
-                let Some(parent) = cursor else { break };
-                if parent == &lc.name {
-                    let name = other.name.0.as_str().to_string();
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
-                    break;
+            if ancestry.superclasses(&other.name).iter().skip(1).take(8).any(|parent| *parent == lc.name) {
+                let name = other.name.0.as_str().to_string();
+                if !names.contains(&name) {
+                    names.push(name);
                 }
-                cursor = parent_of.get(parent).copied();
             }
         }
         out.insert(lc.name.clone(), names);

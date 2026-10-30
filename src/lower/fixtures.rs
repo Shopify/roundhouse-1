@@ -736,15 +736,13 @@ impl<'a> ModelIndex<'a> {
         if let Some(m) = self.models.get(class) {
             return Some(m);
         }
-        let mut cursor = class;
-        for _ in 0..16 {
-            let parent = self.parents.get(cursor)?;
-            if let Some(m) = self.models.get(parent) {
-                return Some(m);
-            }
-            cursor = parent;
-        }
-        None
+        let links = crate::ancestry::ParentLinks(|id: &ClassId| self.parents.get(id).map(|parent| (*parent).clone()));
+        crate::ancestry::Ancestors::new(None, links)
+            .superclasses(class)
+            .into_iter()
+            .skip(1)
+            .take(16)
+            .find_map(|parent| self.models.get(&parent).copied())
     }
 }
 
@@ -758,21 +756,14 @@ fn fixture_model<'a>(fixture: &Fixture, index: &ModelIndex<'a>) -> Option<&'a Mo
 /// The model's table, as Rails' `table_name` answers it: an STI
 /// subclass's rows live in its base class's table.
 fn model_table(model: &Model, app: &App) -> Symbol {
-    let mut current = model;
-    for _ in 0..64 {
-        if app.schema.tables.contains_key(&current.table.0) {
-            return current.table.0.clone();
-        }
-        let Some(parent) = current
-            .parent
-            .as_ref()
-            .and_then(|p| app.models.iter().find(|m| &m.name == p))
-        else {
-            break;
-        };
-        current = parent;
-    }
-    model.table.0.clone()
+    let chain = crate::ancestry::Ancestors::new(None, crate::ancestry::ModelList::scan(&app.models)).above(model.parent.as_ref());
+    std::iter::once(model)
+        .chain(chain.iter().take(63).map_while(|parent| app.models.iter().find(|m| m.name == *parent)))
+        .find(|current| app.schema.tables.contains_key(&current.table.0))
+        .unwrap_or(model)
+        .table
+        .0
+        .clone()
 }
 
 /// The table a set's rows insert into. `_fixture: table_name` first (a

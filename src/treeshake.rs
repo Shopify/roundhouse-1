@@ -418,42 +418,53 @@ fn walk_inheritance_for_method(
     None
 }
 
-/// Look up a method definition by walking the inheritance chain
-/// (parent + includes). Returns `(owning_class, method_def)` — the
-/// class where the method was actually found.
+/// Look up a method definition in Ruby's ancestor order
+/// (`crate::ancestry`): the class, its included modules (the last one
+/// first, each with its own), then its superclass's. Returns
+/// `(owning_class, method_def)`, the class where the method was found.
 fn lookup_method<'a>(
     registry: &'a HashMap<ClassId, Vec<&'a LibraryClass>>,
     class: &ClassId,
     method: &Symbol,
 ) -> Option<(ClassId, &'a crate::dialect::MethodDef)> {
     // Try each class candidate matching this name (simple-name
-    // ambiguity), and walk each one's inheritance chain (parent +
-    // includes) looking for the method. First match wins.
+    // ambiguity) and walk each one's ancestors. First match wins.
     let candidates = registry.get(class)?;
     for start in candidates {
-        let mut visited: crate::det::HashSet<ClassId> =
-            crate::det::HashSet::default();
-        let mut stack: Vec<&LibraryClass> = vec![*start];
-        while let Some(lc) = stack.pop() {
-            if !visited.insert(lc.name.clone()) {
-                continue;
-            }
-            if let Some(m) = lc.methods.iter().find(|m| m.name == *method) {
-                return Some((lc.name.clone(), m));
-            }
-            for inc in lc.includes.iter().rev() {
-                if let Some(inc_lc) = registry.get(inc).and_then(|v| v.first()) {
-                    stack.push(*inc_lc);
-                }
-            }
-            if let Some(parent) = &lc.parent {
-                if let Some(parent_lc) = registry.get(parent).and_then(|v| v.first()) {
-                    stack.push(*parent_lc);
-                }
+        let links = Registry { registry, start };
+        for ancestor in crate::ancestry::Ancestors::new(None, links).of(&start.name) {
+            let owner = if ancestor == start.name { Some(*start) } else { registry.get(&ancestor).and_then(|v| v.first().copied()) };
+            if let Some(m) = owner.and_then(|lc| lc.methods.iter().find(|m| m.name == *method)) {
+                return Some((ancestor, m));
             }
         }
     }
     None
+}
+
+/// The lookup registry's links: `start`'s own, and each other name's
+/// first class.
+struct Registry<'a> {
+    registry: &'a HashMap<ClassId, Vec<&'a LibraryClass>>,
+    start: &'a LibraryClass,
+}
+
+impl Registry<'_> {
+    fn class(&self, id: &ClassId) -> Option<&LibraryClass> {
+        if *id == self.start.name { Some(self.start) } else { self.registry.get(id)?.first().copied() }
+    }
+}
+
+impl crate::ancestry::Links for Registry<'_> {
+    fn parent(&self, id: &ClassId) -> Option<ClassId> {
+        self.class(id)?.parent.clone()
+    }
+    fn includes(&self, id: &ClassId) -> Vec<ClassId> {
+        self.class(id).map(|lc| lc.includes.clone()).unwrap_or_default()
+    }
+    fn extends(&self, _id: &ClassId) -> Vec<ClassId> {
+        Vec::new()
+    }
 }
 
 /// Filter a runtime `LibraryClass.methods` to only methods reachable
@@ -584,4 +595,28 @@ mod tests {
         assert!(seen.iter().enumerate().filter(|(i, _)| !matches!(i, 0 | 4))
             .all(|(_, (ty, _))| ty.is_none()));
     }
+
+    /// Ruby looks a method up in the modules a class includes before its
+    /// superclass: `Child.new.hello` is the module's.
+    #[test]
+    fn lookup_reaches_an_included_module_before_the_superclass() {
+        let tree: crate::det::HashMap<std::path::PathBuf, Vec<u8>> = [
+            ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+            ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+            ("app/services/base.rb", "class Base\n  def hello = \"base\"\nend\n"),
+            ("app/services/greeting.rb", "module Greeting\n  def hello = \"module\"\nend\n"),
+            ("app/services/child.rb", "class Child < Base\n  include Greeting\nend\n"),
+        ]
+        .into_iter()
+        .map(|(path, text)| (std::path::PathBuf::from(path), text.as_bytes().to_vec()))
+        .collect();
+        let app = crate::ingest::ingest_app_from_tree(tree).expect("ingest");
+        let mut registry: HashMap<ClassId, Vec<&LibraryClass>> = HashMap::default();
+        for lc in &app.library_classes {
+            registry.entry(lc.name.clone()).or_default().push(lc);
+        }
+        let (owner, _) = lookup_method(&registry, &ClassId(Symbol::from("Child")), &Symbol::from("hello")).expect("hello");
+        assert_eq!(owner.0.as_str(), "Greeting");
+    }
+
 }

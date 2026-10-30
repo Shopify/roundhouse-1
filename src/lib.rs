@@ -6,6 +6,7 @@
 
 pub mod adapter;
 pub mod analyze;
+pub(crate) mod ancestry;
 pub mod app;
 pub mod body;
 pub mod store;

@@ -41,14 +41,18 @@ use crate::span::{SourceFile, Span};
 const MAX_DEPTH: usize = 8;
 
 pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
-    let parents: HashMap<ClassId, ClassId> = app
-        .models
-        .iter()
-        .filter_map(|m| Some((m.name.clone(), m.parent.clone()?)))
-        .chain(app.library_classes.iter().filter(|lc| !lc.is_module).filter_map(|lc| Some((lc.name.clone(), lc.parent.clone()?))))
-        .collect();
+    // Each model's app superclasses, nearest first.
+    let chains: Vec<Vec<ClassId>> = {
+        let ancestry = crate::ancestry::Ancestors::for_app(app);
+        app.models
+            .iter()
+            .map(|model| {
+                ancestry.superclasses(&model.name).into_iter().skip(1).take_while(|class| ancestry.app_defines(class)).collect()
+            })
+            .collect()
+    };
     for model_index in 0..app.models.len() {
-        let ancestors = ancestors(app, &parents, &app.models[model_index].name);
+        let ancestors = chains[model_index].clone();
         if ancestors.is_empty() {
             continue;
         }
@@ -184,19 +188,6 @@ fn synthesized_names(app: &App, model_index: usize) -> HashSet<Symbol> {
             out.remove(&c.name);
             out.remove(&Symbol::from(format!("{}=", c.name.as_str())));
         }
-    }
-    out
-}
-
-fn ancestors(app: &App, parents: &HashMap<ClassId, ClassId>, model: &ClassId) -> Vec<ClassId> {
-    let mut out = Vec::new();
-    let mut cur = parents.get(model);
-    while let Some(p) = cur {
-        if out.contains(p) || !(app.models.iter().any(|m| &m.name == p) || app.library_classes.iter().any(|lc| &lc.name == p)) {
-            break;
-        }
-        out.push(p.clone());
-        cur = parents.get(p);
     }
     out
 }

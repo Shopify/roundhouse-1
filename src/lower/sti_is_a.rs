@@ -69,16 +69,9 @@ pub fn apply_sti_is_a_lowering(app: &mut App) {
 pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, (Symbol, Vec<String>)> {
     let bases = crate::lower::sti_scope::sti_bases(app);
     let cols = crate::lower::sti_scope::sti_columns(app);
-    // Each name's FIRST library class's parent (the linear `find` this
-    // replaced answered that element), and each subclass's parents as
-    // `descends_from` reads them: per pair, per hop, a scan of every
-    // library class was 26 s of the fused pre-tag group on full Core.
-    let mut lc_parent: HashMap<&ClassId, Option<&ClassId>> = HashMap::default();
-    for lc in &app.library_classes {
-        lc_parent.entry(&lc.name).or_insert(lc.parent.as_ref());
-    }
-    let chains: HashMap<&ClassId, Vec<&ClassId>> =
-        bases.keys().map(|other| (other, ancestors(&lc_parent, other))).collect();
+    let ancestry = crate::ancestry::Ancestors::for_app(app);
+    let chains: HashMap<&ClassId, Vec<ClassId>> =
+        bases.keys().map(|other| (other, ancestry.superclasses(other))).collect();
     let mut names: HashMap<ClassId, (Symbol, Vec<String>)> = HashMap::default();
     // A runtime-named hierarchy stores the app's `sti_name`, not the
     // class name; its objects hydrate as their class
@@ -87,7 +80,7 @@ pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, (Symbol, Vec<St
     for sub in bases.keys().filter(|s| !runtime_named.contains(*s)) {
         let mut set: Vec<String> = vec![sub.0.as_str().to_string()];
         for other in bases.keys() {
-            if other != sub && chains[other].contains(&sub) {
+            if other != sub && chains[other].contains(sub) {
                 set.push(other.0.as_str().to_string());
             }
         }
@@ -96,24 +89,6 @@ pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, (Symbol, Vec<St
         names.insert(sub.clone(), (col, set));
     }
     names
-}
-
-/// The parents `class_id`'s chain reaches within nine hops, nearest
-/// first: the ones whose being `ancestor` makes `class_id` descend from
-/// it. `lc_parent` is each name's first library class's parent.
-fn ancestors<'a>(lc_parent: &HashMap<&ClassId, Option<&'a ClassId>>, class_id: &ClassId) -> Vec<&'a ClassId> {
-    let mut out = Vec::new();
-    let mut cursor = lc_parent.get(class_id).copied().flatten();
-    let mut hops = 0;
-    while let Some(parent) = cursor {
-        if hops > 8 {
-            break;
-        }
-        out.push(parent);
-        cursor = lc_parent.get(parent).copied().flatten();
-        hops += 1;
-    }
-    out
 }
 
 fn rewrite(expr: &mut Expr, names: &HashMap<ClassId, (Symbol, Vec<String>)>) {

@@ -8,18 +8,18 @@ use crate::ident::ClassId;
 use crate::ty::Ty;
 
 struct Owners<'a> {
-    parents: HashMap<&'a ClassId, &'a ClassId>,
-    defined: HashMap<(&'a ClassId, bool, &'a str), MethodVisibility>,
+    ancestry: crate::ancestry::Ancestors<'a, crate::ancestry::AppLinks<'a>>,
+    defined: HashMap<(ClassId, bool, &'a str), MethodVisibility>,
 }
 
 impl<'a> Owners<'a> {
     fn of(app: &'a App) -> Self {
-        let mut out = Owners { parents: HashMap::new(), defined: HashMap::new() };
+        let mut defined = HashMap::new();
         let mut define = |owner: &'a ClassId, methods: &mut dyn Iterator<Item = &'a MethodDef>| {
             for m in methods {
-                let key = (owner, m.receiver == MethodReceiver::Class, m.name.as_str());
+                let key = (owner.clone(), m.receiver == MethodReceiver::Class, m.name.as_str());
                 // Not the first definition: Ruby keeps the later one, visibility included.
-                out.defined.insert(key, m.visibility);
+                defined.insert(key, m.visibility);
             }
         };
         for model in &app.models {
@@ -28,27 +28,14 @@ impl<'a> Owners<'a> {
         for lc in app.library_classes.iter().filter(|lc| !lc.is_module) {
             define(&lc.name, &mut lc.methods.iter());
         }
-        for model in &app.models {
-            if let Some(p) = &model.parent {
-                out.parents.insert(&model.name, p);
-            }
-        }
-        for lc in &app.library_classes {
-            if let Some(p) = &lc.parent {
-                out.parents.insert(&lc.name, p);
-            }
-        }
-        out
+        Owners { ancestry: crate::ancestry::Ancestors::for_app(app), defined }
     }
 
     fn private(&self, class: &ClassId, class_side: bool, name: &str) -> bool {
-        let mut cur = Some(class);
-        for _ in 0..32 {
-            let Some(id) = cur else { return false };
+        for id in self.ancestry.superclasses(class).into_iter().take(32) {
             if let Some(visibility) = self.defined.get(&(id, class_side, name)) {
                 return *visibility == MethodVisibility::Private;
             }
-            cur = self.parents.get(id).copied();
         }
         false
     }

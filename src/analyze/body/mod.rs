@@ -55,7 +55,7 @@ mod diagnostic;
 mod deps;
 pub(crate) use deps::{class_set_key, Classes, DepKey, DepRecorder, Mix};
 mod const_resolution;
-pub(crate) use const_resolution::{ConstResolver, ConstResolverTask};
+pub(crate) use const_resolution::{Ancestry, ConstResolver, ConstResolverTask, SingletonAncestor};
 pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
 mod narrowing;
@@ -418,42 +418,11 @@ pub(crate) fn cref_class(written: &ClassId, scope: &str, classes: Classes<'_>) -
 /// The ancestors of `scope` that Ruby's constant lookup searches after
 /// the lexical scopes, nearest first, `scope` itself excluded: its
 /// includes (the last one first, each with its own), then its superclass
-/// chain. A mixin no registry entry answers for stands in by each of its
-/// lexical spellings.
+/// chain (`crate::ancestry`, over the registry's resolved links).
 pub(crate) fn cref_ancestors(scope: &str, classes: Classes<'_>) -> Vec<ClassId> {
-    fn ancestors(id: &ClassId, classes: Classes<'_>, out: &mut Vec<ClassId>) {
-        if out.contains(id) || out.len() > 64 {
-            return;
-        }
-        out.push(id.clone());
-        let Some(info) = classes.get(id) else { return };
-        // A mixin is recorded as written (`include AggregatedCounter`),
-        // so it is found from inside the class body that wrote it; a
-        // superclass from the namespace around the class. A module that
-        // only nests classes is no registry entry of its own: each of its
-        // lexical spellings stands in as an owner.
-        for module in info.includes().iter().rev() {
-            match lexical_class(module, id.0.as_str(), classes) {
-                Some(module) => ancestors(&module, classes, out),
-                None => {
-                    let mut parts: Vec<&str> = id.0.as_str().split("::").collect();
-                    while !parts.is_empty() {
-                        out.push(ClassId(Symbol::from(format!("{}::{}", parts.join("::"), module.0).as_str())));
-                        parts.pop();
-                    }
-                    out.push(module.clone());
-                }
-            }
-        }
-        if let Some(parent) = info.parent() {
-            let outer = id.0.as_str().rsplit_once("::").map_or("", |(outer, _)| outer);
-            let parent = lexical_class(parent, outer, classes).unwrap_or_else(|| parent.clone());
-            ancestors(&parent, classes, out);
-        }
-    }
-    let mut chain = Vec::new();
-    ancestors(&ClassId(Symbol::from(scope)), classes, &mut chain);
-    chain.remove(0);
+    let scope = ClassId(Symbol::from(scope));
+    let mut chain = crate::ancestry::Ancestors::new(None, classes).of(&scope);
+    chain.retain(|ancestor| *ancestor != scope);
     chain
 }
 
@@ -685,12 +654,18 @@ impl<'a> BodyTyper<'a> {
         Classes::new(self.classes, self.deps)
     }
 
+    /// Ruby's ancestors of a class, from Rubydex's answers and this
+    /// registry (`crate::ancestry`); registry reads are noted.
+    pub(super) fn ancestry(&self) -> crate::ancestry::Ancestors<'_, Classes<'a>> {
+        crate::ancestry::Ancestors::new(self.const_resolver.as_deref(), self.classes())
+    }
+
     /// `ActionView::Helpers::FormBuilder`, or an app builder (`builder:`)
     /// descending from it.
     fn is_form_builder(&self, id: &ClassId) -> bool {
         const FORM_BUILDER: &str = "ActionView::Helpers::FormBuilder";
         id.0.as_str() == FORM_BUILDER
-            || cref_ancestors(id.0.as_str(), self.classes()).iter().any(|a| a.0.as_str().trim_start_matches("::") == FORM_BUILDER)
+            || self.ancestry().of(id).iter().any(|a| a.0.as_str() == FORM_BUILDER)
     }
 
     /// A source constant's inferred value, noted as a read.

@@ -2395,17 +2395,14 @@ fn inheritor_view_modules(controller: &Controller, all: &[Controller]) -> Vec<St
         .collect()
 }
 
+/// `controller`'s controller ancestors, the farthest first, at most eight.
 fn ancestor_chain<'a>(controller: &Controller, all: &'a [Controller]) -> Vec<&'a Controller> {
-    let mut chain: Vec<&'a Controller> = Vec::new();
-    let mut cur = controller.parent.as_ref();
-    while let Some(pid) = cur {
-        if chain.len() >= 8 {
-            break;
-        }
-        let Some(p) = all.iter().find(|c| &c.name == pid) else { break };
-        chain.push(p);
-        cur = p.parent.as_ref();
-    }
+    let superclasses = crate::ancestry::Ancestors::new(None, crate::ancestry::ControllerList::scan(all)).above(controller.parent.as_ref());
+    let mut chain: Vec<&'a Controller> = superclasses
+        .iter()
+        .take(8)
+        .map_while(|parent| all.iter().find(|c| c.name == *parent))
+        .collect();
     chain.reverse();
     chain
 }
