@@ -149,6 +149,9 @@ pub(super) fn lift<V: Vfs + ?Sized>(
                         let id = crate::ident::ClassId(crate::ident::Symbol::from(path.join("::").as_str()));
                         if !class.includes.contains(&id) {
                             class.includes.push(id);
+                            // The call, so the name resolves where the
+                            // reopen writes it (`written_names`).
+                            class.include_spans.push(super::util::node_span(&call.as_node(), &file));
                         }
                     }
                 }

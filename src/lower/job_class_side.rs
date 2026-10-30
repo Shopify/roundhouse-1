@@ -32,43 +32,22 @@ use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
 use crate::ty::Ty;
 
-/// A library class's parent, looked up from the class's namespace outward
-/// among `classes` as Ruby binds the written name (`class TrackCreateJob <
-/// TrackJob` in `module ShopEvent` is `ShopEvent::TrackJob`), as
-/// `emit::ruby::library::lexical_parent` does. Ingest records the name as
-/// written and binds it only after the concern splices, which read it
-/// (`library_class::resolve_library_parents`). A name no class in
-/// `classes` (the names of the app's classes, [`class_names`]) has at any
-/// level stays as written (`ActiveJob::Base`).
-pub(crate) fn lexical_parent_name(lc: &LibraryClass, classes: &BTreeSet<&str>) -> Option<String> {
-    let written = lc.parent.as_ref()?.0.as_str();
-    if let Some(absolute) = written.strip_prefix("::") {
-        return Some(absolute.to_string());
-    }
-    let mut scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
-    scope.pop();
-    while !scope.is_empty() {
-        let candidate = format!("{}::{written}", scope.join("::"));
-        if candidate != lc.name.0.as_str() && classes.contains(candidate.as_str()) {
-            return Some(candidate);
-        }
-        scope.pop();
-    }
-    Some(written.to_string())
-}
-
-/// The names of the classes (not modules) among `classes`.
-pub(crate) fn class_names(classes: &[LibraryClass]) -> BTreeSet<&str> {
-    classes.iter().filter(|c| !c.is_module).map(|c| c.name.0.as_str()).collect()
+/// A library class's parent, without the leading `::` of a rooted name.
+/// Ingest stored it as Rubydex resolved it (`ingest::written_names`), so
+/// `class TrackCreateJob < TrackJob` in `module ShopEvent` already names
+/// `ShopEvent::TrackJob`; a name Rubydex had no answer for
+/// (`ActiveJob::Base`) stays as written.
+pub(crate) fn parent_name(lc: &LibraryClass) -> Option<String> {
+    let parent = lc.parent.as_ref()?.0.as_str();
+    Some(parent.strip_prefix("::").unwrap_or(parent).to_string())
 }
 
 /// The app's job classes: those whose parent chain (within the ingested
 /// set) reaches ActiveJob::Base (ApplicationJob names ActiveJob::Base;
 /// concrete jobs name ApplicationJob).
 pub(crate) fn job_class_names(classes: &[LibraryClass]) -> BTreeSet<String> {
-    let names = class_names(classes);
     let parents: Vec<(&str, Option<String>)> =
-        classes.iter().map(|lc| (lc.name.0.as_str(), lexical_parent_name(lc, &names))).collect();
+        classes.iter().map(|lc| (lc.name.0.as_str(), parent_name(lc))).collect();
     let mut jobs: BTreeSet<String> = BTreeSet::new();
     loop {
         let mut changed = false;
@@ -196,12 +175,11 @@ pub(crate) fn callback_registering_hook(module: &LibraryClass) -> Option<Vec<&Ex
 /// includes ActiveJob::Callbacks ahead of everything an app job class
 /// includes.
 fn adopt_callbacks_port(app: &mut App, jobs: &BTreeSet<String>) -> BTreeSet<String> {
-    let names = class_names(&app.library_classes);
     let parents: std::collections::BTreeMap<&str, String> = app
         .library_classes
         .iter()
         .filter(|lc| jobs.contains(lc.name.0.as_str()))
-        .filter_map(|lc| Some((lc.name.0.as_str(), lexical_parent_name(lc, &names)?)))
+        .filter_map(|lc| Some((lc.name.0.as_str(), parent_name(lc)?)))
         .filter(|(_, p)| jobs.contains(p))
         .collect();
     let parent_of = |name: &str| -> Option<String> { parents.get(name).cloned() };

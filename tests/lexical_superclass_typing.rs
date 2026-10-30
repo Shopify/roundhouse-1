@@ -4,9 +4,9 @@
 //! innermost first, then the top level: inside `module Errs`, `Fallback`
 //! is `Errs::Fallback`; in a top-level compact `class Errs::Unavailable
 //! < Fallback` it is the top-level `Fallback`. Rubydex binds a source
-//! superclass at ingest (`resolve_library_parents`, which also covers
-//! STI subclasses); `analyze::superclass_binding` binds one only a gem's
-//! RBI defines.
+//! superclass at ingest (`ingest::written_names`, for library classes,
+//! models and controllers alike); `analyze::superclass_binding` binds one
+//! only a gem's RBI defines.
 //!
 //! CRuby is the oracle: each shape loads natively and answers which of
 //! the two shadowing classes defines methods for it; the analyzer must
@@ -118,6 +118,47 @@ fn a_namespaced_sti_subclass_binds_the_namespace_model() {
     let card_reader = reader("CardReader", "Pay::Card");
     let text = check(&[schema, top, pay, inner, card, ("app/lib/card_reader.rb", &card_reader)]);
     assert_eq!(unresolved(&text, "card_reader.rb"), ["top_only"], "{text}");
+}
+
+/// A model's superclass, which no library-class pass bound: inside
+/// `module Admin`, `Record` is the app's `Admin::Record`, even though a
+/// top-level `Record` model exists too, and in a top-level compact
+/// `class Admin::Note < Record` it is the top-level one.
+#[test]
+fn a_nested_model_binds_the_namespace_abstract_class() {
+    let schema = (
+        "db/schema.rb",
+        "ActiveRecord::Schema.define do\n  create_table :posts do |t|\n  end\n  create_table :notes do |t|\n  end\nend\n",
+    );
+    let top = ("app/models/record.rb", "class Record < ApplicationRecord\n  self.abstract_class = true\n  def top_only = 1\nend\n");
+    let inner = (
+        "app/models/admin/record.rb",
+        "module Admin\n  class Record < ApplicationRecord\n    self.abstract_class = true\n    def inner_only = 2\n  end\nend\n",
+    );
+    let post = ("app/models/admin/post.rb", "module Admin\n  class Post < Record\n  end\nend\n");
+    let note = ("app/models/admin/note.rb", "class Admin::Note < Record\nend\n");
+    let native_files = [
+        ("", "require \"active_record\"\nclass ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        top,
+        inner,
+        post,
+        note,
+    ];
+    assert_eq!(native(&native_files, &["Admin::Post", "Admin::Note"]), "[false, true]\n[true, false]\n");
+
+    let post_reader = reader("PostReader", "Admin::Post");
+    let note_reader = reader("NoteReader", "Admin::Note");
+    let text = check(&[
+        schema,
+        top,
+        inner,
+        post,
+        note,
+        ("app/lib/post_reader.rb", &post_reader),
+        ("app/lib/note_reader.rb", &note_reader),
+    ]);
+    assert_eq!(unresolved(&text, "post_reader.rb"), ["top_only"], "{text}");
+    assert_eq!(unresolved(&text, "note_reader.rb"), ["inner_only"], "{text}");
 }
 
 /// The methods each `class` reaches, by the `#: (class) -> untyped`
